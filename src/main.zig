@@ -1,10 +1,10 @@
 const std = @import("std");
 const lsp = @import("lsp");
-const jade = @import("jade");
+const jade = @import("jade_toml_lsp");
 const toml = @import("toml");
 
 const types = lsp.types;
-const FormatCommand = "jade.formatToml";
+const FormatCommand = "jade_toml_lsp.formatToml";
 
 const DiagnosticsSeverity = enum {
     off,
@@ -84,7 +84,7 @@ const Server = struct {
                 .inlayHintProvider = .{ .bool = true },
             },
             .serverInfo = .{
-                .name = "jade",
+                .name = "jade_toml_lsp",
                 .version = "0.0.1",
             },
         };
@@ -625,10 +625,10 @@ const Server = struct {
         }
 
         if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
-            std.debug.print("jade diagnostics: spans={d} uri={s}\n", .{ template_spans.len, uri });
+            std.debug.print("jade_toml_lsp diagnostics: spans={d} uri={s}\n", .{ template_spans.len, uri });
             if (jade.lineSlice(text, 0)) |lt| {
                 const span = jade.errorSpan(lt, 0);
-                const message = std.fmt.allocPrint(handler.allocator, "jade debug diagnostic", .{}) catch return;
+                const message = std.fmt.allocPrint(handler.allocator, "jade_toml_lsp debug diagnostic", .{}) catch return;
                 allocated_messages.append(handler.allocator, message) catch return;
                 diagnostics.append(handler.allocator, .{
                     .range = .{
@@ -636,7 +636,7 @@ const Server = struct {
                         .end = .{ .line = 0, .character = @intCast(span.end) },
                     },
                     .severity = .Information,
-                    .source = "jade",
+                    .source = "jade_toml_lsp",
                     .message = message,
                 }) catch {};
             }
@@ -826,7 +826,7 @@ const Server = struct {
         }
 
         if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
-            std.debug.print("jade diagnostics: count={d} uri={s}\n", .{ diagnostics.items.len, uri });
+            std.debug.print("jade_toml_lsp diagnostics: count={d} uri={s}\n", .{ diagnostics.items.len, uri });
         }
 
         handler.publishDiagnostics(uri, diagnostics.items);
@@ -846,7 +846,7 @@ fn publishDiagnostics(handler: *Server, uri: []const u8, diagnostics: []const ty
             .{ .emit_null_optional_fields = false },
         ) catch |err| {
             if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
-                std.debug.print("jade publish diagnostics error: {s}\n", .{@errorName(err)});
+                std.debug.print("jade_toml_lsp publish diagnostics error: {s}\n", .{@errorName(err)});
             }
         };
     }
@@ -1011,7 +1011,7 @@ fn templatedTomlDiagnostic(
             .end = .{ .line = @intCast(line), .character = @intCast(span.end) },
         },
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -1053,7 +1053,7 @@ fn templateOutsideQuotesDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -1081,7 +1081,7 @@ fn templateMissingKeyDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -1110,7 +1110,7 @@ fn templateCycleDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -1677,7 +1677,7 @@ fn keyConflictRangeDiagnostic(
             .end = .{ .line = @intCast(range.line), .character = @intCast(range.end) },
         },
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -1803,7 +1803,7 @@ fn inlineTableDiagnostic(
             .end = .{ .line = @intCast(line), .character = @intCast(col + 1) },
         },
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -2713,7 +2713,7 @@ fn templateKeyDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -2731,7 +2731,7 @@ fn templateInlineKeyDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -2749,7 +2749,7 @@ fn templateHeaderDiagnostic(
     return .{
         .range = range,
         .severity = diagnosticSeverityToLsp(severity),
-        .source = "jade",
+        .source = "jade_toml_lsp",
         .message = message,
     };
 }
@@ -2782,7 +2782,7 @@ fn collectCommentControlCharDiagnostics(
                 diagnostics.append(allocator, .{
                     .range = range,
                     .severity = diagnosticSeverityToLsp(severity),
-                    .source = "jade",
+                    .source = "jade_toml_lsp",
                     .message = message,
                 }) catch {};
             }
@@ -3668,7 +3668,15 @@ fn applyJsonSettings(settings: *Settings, value: std.json.Value) void {
         applyJsonSettings(settings, inner);
         return;
     }
+    if (obj.get("jade_toml_lsp")) |inner| {
+        applyJsonSettings(settings, inner);
+        return;
+    }
     if (obj.get("jade-lsp")) |inner| {
+        applyJsonSettings(settings, inner);
+        return;
+    }
+    if (obj.get("jade-toml-lsp")) |inner| {
         applyJsonSettings(settings, inner);
         return;
     }
@@ -4606,7 +4614,7 @@ pub fn main() !void {
         .settings = .{},
     };
 
-    try lsp.basic_server.run(allocator, &stdio.transport, &server, std.log.scoped(.jade).err);
+    try lsp.basic_server.run(allocator, &stdio.transport, &server, std.log.scoped(.jade_toml_lsp).err);
 }
 
 fn runCli(allocator: std.mem.Allocator) !bool {

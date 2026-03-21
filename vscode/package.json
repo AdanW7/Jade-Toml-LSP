@@ -1,0 +1,130 @@
+{
+  "name": "jade-toml-lsp",
+  "displayName": "Jade TOML LSP",
+  "description": "Language Server support for templated TOML with Jade.",
+  "version": "0.0.1",
+  "publisher": "jade",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adan/dotfiles"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:toml"
+  ],
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "toml",
+        "aliases": ["TOML", "toml"],
+        "extensions": [".toml"],
+        "filenames": ["jade.toml"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "toml",
+        "scopeName": "source.toml",
+        "path": "./syntaxes/toml.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Jade LSP",
+      "properties": {
+        "jade_toml_lsp.inlayHints.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable inlay hints for templated values."
+        },
+        "jade_toml_lsp.format.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Jade formatting."
+        },
+        "jade_toml_lsp.format.respect_trailing_commas": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep trailing commas in arrays and format them as multiline."
+        },
+        "jade_toml_lsp.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostics."
+        },
+        "jade_toml_lsp.diagnostics.severity": {
+          "type": "string",
+          "default": "error",
+          "enum": ["off", "error", "warning", "info", "hint"],
+          "description": "Default diagnostics severity."
+        },
+        "jade_toml_lsp.diagnostics.templates.outside_quotes": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "error"
+          },
+          "description": "Template diagnostics for values outside quotes."
+        },
+        "jade_toml_lsp.diagnostics.templates.missing_key": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "warning"
+          },
+          "description": "Template diagnostics for missing keys."
+        },
+        "jade_toml_lsp.diagnostics.templates.cycle": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "warning"
+          },
+          "description": "Template diagnostics for cyclic references."
+        },
+        "jade_toml_lsp.diagnostics.templates.in_keys": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "error"
+          },
+          "description": "Template diagnostics for use in keys."
+        },
+        "jade_toml_lsp.diagnostics.templates.inline_keys": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "error"
+          },
+          "description": "Template diagnostics for inline table keys."
+        },
+        "jade_toml_lsp.diagnostics.templates.in_headers": {
+          "type": "object",
+          "default": {
+            "enabled": true,
+            "severity": "error"
+          },
+          "description": "Template diagnostics for table headers."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node ./build.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.1"
+  }
+}

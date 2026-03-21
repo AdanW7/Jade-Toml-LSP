@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("jade", .{
+    const mod = b.addModule("jade_toml_lsp", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
         // in this file, which means that if you have declarations that you
@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "jade",
+        .name = "jade_toml_lsp",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "jade", .module = mod },
+                .{ .name = "jade_toml_lsp", .module = mod },
                 .{ .name = "lsp", .module = lsp_module },
                 .{ .name = "toml", .module = toml_module },
             },
@@ -269,13 +269,13 @@ fn addReleaseMatrix(
         };
         const target = b.resolveTargetQuery(query);
         const exe = b.addExecutable(.{
-            .name = "jade",
+            .name = "jade_toml_lsp",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
                 .optimize = .ReleaseFast,
                 .imports = &.{
-                    .{ .name = "jade", .module = mod },
+                    .{ .name = "jade_toml_lsp", .module = mod },
                     .{ .name = "lsp", .module = lsp_module },
                     .{ .name = "toml", .module = toml_module },
                 },

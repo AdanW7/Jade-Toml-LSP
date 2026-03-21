@@ -1,9 +1,9 @@
-# Jade
+# Jade TOML LSP
 
-Zig 0.15.2 LSP scaffold using lsp-kit (0.15.x branch) for templated YAML/TOML.
+Zig 0.15.2 LSP scaffold using lsp-kit (0.15.x branch) for templated TOML.
 
 ## Goals
-- Handle plain `.yaml`, `.yml`, and `.toml` files.
+- Handle plain `.toml` files.
 - Tolerate Jinja-style `{{ ... }}` blocks by masking them before parse.
 - Provide diagnostics and (eventually) completions inside template blocks.
 
@@ -47,6 +47,9 @@ severity = "error"
 [diagnostics.templates.in_headers]
 enabled = true
 severity = "error"
+
+[inlay_hints]
+enabled = false
 ```
 
 The server searches upward from the file’s directory to find `jade.toml`.
@@ -71,24 +74,24 @@ zig build
 Then point `vim.lsp.config` to the built executable (adjust path if needed):
 
 ```lua
-vim.lsp.config("jade", {
-  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/jade" },
-  filetypes = { "toml", "yaml", "yml" },
+vim.lsp.config("jade_toml_lsp", {
+  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/macos/aarch64/release/jade_toml_lsp" },
+  filetypes = { "toml" },
   root_markers = { "jade.toml", ".git" },
 })
 
-vim.lsp.enable("jade")
+vim.lsp.enable("jade_toml_lsp")
 ```
 
 If you want to pass LSP settings instead of `jade.toml`, use:
 
 ```lua
-vim.lsp.config("jade", {
-  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/jade" },
-  filetypes = { "toml", "yaml", "yml" },
+vim.lsp.config("jade_toml_lsp", {
+  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/macos/aarch64/release/jade_toml_lsp" },
+  filetypes = { "toml" },
   root_markers = { "jade.toml", ".git" },
   settings = {
-    jade = {
+    jade_toml_lsp = {
       format = {
         enabled = true,
         respect_trailing_commas = false,
@@ -110,6 +113,9 @@ vim.lsp.config("jade", {
         templateInKeys = "error",
         templateInlineKeys = "error",
         templateInHeaders = "error",
+      },
+      inlayHints = {
+        enabled = false,
       },
     },
   },
@@ -134,3 +140,5 @@ JSON settings mirror the TOML keys:
 - `diagnostics.templateInKeys`
 - `diagnostics.templateInlineKeys`
 - `diagnostics.templateInHeaders`
+- `inlay_hints.enabled`
+- `inlayHints.enabled`
