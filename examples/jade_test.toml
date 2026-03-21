@@ -1,14 +1,30 @@
 title = "{{ params.title }}"
+
 [params]
+title = "Example"
 port = 9000
 retries = 2
-title = "Example"
+labels = ["alpha", "beta", "gamma"]
+owners = ["alice", "bob"]
+thresholds = [1, 2, 3]
+limits = { min = 1, max = 5 }
+flags = { enabled = true, limit = 3, note = "{{ params.title }}" }
+
 [server]
 host = "127.0.0.1"
-ports = [ 8000, 8001, "{{ params.port }}" ]
+ports = [8000, 8001, "{{ params.port }}"]
+aliases = ["{{ params.labels.0 }}", "edge"]
+meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners.0 }}" }
+
 [[services]]
-config = { retries = "{{ params.retries }}", timeout = 30 }
 name = "web"
+config = { timeout = 30, retries = "{{ params.retries }}" }
+owner = "{{ params.owners.0 }}"
+tags = ["http", "primary", "{{ params.labels.1 }}"]
+limits = { min = "{{ params.limits.min }}", max = "{{ params.limits.max }}" }
+
 [[services]]
-config = { retries = 1, timeout = 60 }
 name = "worker"
+config = { timeout = 60, retries = 1 }
+owner = "{{ params.owners.1 }}"
+tags = ["queue", "bg", "{{ params.labels.2 }}"]

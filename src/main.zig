@@ -62,6 +62,7 @@ const Server = struct {
                 },
                 .hoverProvider = .{ .bool = true },
                 .definitionProvider = .{ .bool = true },
+                .referencesProvider = .{ .bool = true },
             },
             .serverInfo = .{
                 .name = "jade",
@@ -295,6 +296,52 @@ const Server = struct {
         return makeDefinitionResult(arena, location);
     }
 
+    pub fn @"textDocument/references"(
+        handler: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/references"),
+    ) lsp.ResultType("textDocument/references") {
+        const uri = params.textDocument.uri;
+        if (!isTomlUri(uri)) return null;
+
+        const text = handler.docs.get(uri) orelse return null;
+        const line = params.position.line;
+        const character = params.position.character;
+
+        const spans = jade.templateSpans(arena, text) catch return null;
+        defer arena.free(spans);
+
+        var path: [][]const u8 = undefined;
+        if (inTemplateAtFromSpans(spans, text, @intCast(line), @intCast(character))) |span| {
+            path = extractTemplatePath(arena, text, span) orelse return null;
+        } else if (inlineTableHoverInfo(arena, text, line, character)) |inline_info| {
+            path = inline_info.path;
+        } else {
+            path = resolveKeyPathAt(arena, text, line, character) orelse return null;
+        }
+        defer arena.free(path);
+
+        var locations: std.ArrayList(types.Location) = .empty;
+        defer locations.deinit(arena);
+
+        if (collectKeyReferenceRanges(arena, text, path)) |ranges| {
+            defer arena.free(ranges);
+            for (ranges) |range| {
+                locations.append(arena, .{ .uri = uri, .range = range }) catch {};
+            }
+        }
+
+        if (collectTemplateReferenceRanges(arena, text, spans, path)) |ranges| {
+            defer arena.free(ranges);
+            for (ranges) |range| {
+                locations.append(arena, .{ .uri = uri, .range = range }) catch {};
+            }
+        }
+
+        if (locations.items.len == 0) return null;
+        return locations.toOwnedSlice(arena) catch null;
+    }
+
     fn handleText(handler: *Server, uri: []const u8, text: []const u8) void {
         handler.docs.set(uri, text) catch return;
 
@@ -441,9 +488,11 @@ const Server = struct {
 
         const template_span = inTemplateAt(spans, full_text, @intCast(line), @intCast(character));
 
+        const array_ctx = arrayHeaderContext(arena, full_text, line);
+
         if (arrayItemInfo(arena, full_text, line, character)) |array_info| {
             defer arena.free(array_info.path);
-            const value = lookupTomlValue(parsed.value, array_info.path) orelse return null;
+            const value = lookupTomlValueWithContext(parsed.value, array_info.path, array_ctx) orelse return null;
             if (value == .array) {
                 const ar = value.array;
                 if (array_info.index < ar.items.len) {
@@ -461,10 +510,7 @@ const Server = struct {
                             value_text = tomlValueString(arena, item) orelse return null;
                         }
                     } else {
-                        value_text = tomlValueString(arena, item) orelse return null;
-                        if (expandPlaceholderValue(arena, placeholders, parsed.value, item)) |expanded_text| {
-                            value_text = expanded_text;
-                        }
+                        value_text = tomlValueStringExpanded(arena, item, placeholders, parsed.value) catch return null;
                     }
                     return .{
                         .ty = tomlValueType(item),
@@ -478,7 +524,7 @@ const Server = struct {
 
         if (inlineTableHoverInfo(arena, full_text, line, character)) |inline_info| {
             defer arena.free(inline_info.path);
-            const value = lookupTomlValue(parsed.value, inline_info.path) orelse return null;
+            const value = lookupTomlValueWithContext(parsed.value, inline_info.path, array_ctx) orelse return null;
             const value_text = if (template_span) |span|
                 blk: {
                     if (extractTemplatePath(arena, full_text, span)) |template_path| {
@@ -487,19 +533,14 @@ const Server = struct {
                             break :blk tomlValueString(arena, expanded) orelse return null;
                         }
                     }
-                    break :blk tomlValueString(arena, value) orelse return null;
+                    break :blk tomlValueStringExpanded(arena, value, placeholders, parsed.value) catch return null;
                 }
             else
-                tomlValueString(arena, value) orelse return null;
-
-            var final_value = value_text;
-            if (expandPlaceholderValue(arena, placeholders, parsed.value, value)) |expanded_text| {
-                final_value = expanded_text;
-            }
+                tomlValueStringExpanded(arena, value, placeholders, parsed.value) catch return null;
 
             return .{
                 .ty = tomlValueType(value),
-                .value = final_value,
+                .value = value_text,
                 .key = inline_info.key orelse "",
                 .table = inline_info.table orelse "",
             };
@@ -508,8 +549,8 @@ const Server = struct {
         const key_path = resolveKeyPathAt(arena, full_text, line, character) orelse return null;
         defer arena.free(key_path);
 
-        const value = lookupTomlValue(parsed.value, key_path) orelse return null;
-        const value_text = tomlValueString(arena, value) orelse return null;
+        const value = lookupTomlValueWithContext(parsed.value, key_path, array_ctx) orelse return null;
+        const value_text = tomlValueStringExpanded(arena, value, placeholders, parsed.value) catch return null;
 
         const key_name = pathToKeyName(arena, key_path) orelse "";
         const table_name = pathToTableName(arena, key_path) orelse "";
@@ -529,14 +570,9 @@ const Server = struct {
             }
         }
 
-        var final_value = value_text;
-        if (expandPlaceholderValue(arena, placeholders, parsed.value, value)) |expanded_text| {
-            final_value = expanded_text;
-        }
-
         return .{
             .ty = tomlValueType(value),
-            .value = final_value,
+            .value = value_text,
             .key = key_name,
             .table = table_name,
         };
@@ -715,6 +751,14 @@ fn inTemplateAt(spans: []const jade.Span, text: []const u8, line: u32, character
     return null;
 }
 
+fn inTemplateAtFromSpans(spans: []const jade.TemplateSpan, text: []const u8, line: u32, character: u32) ?jade.TemplateSpan {
+    const idx = positionToIndex(text, line, character);
+    for (spans) |span| {
+        if (idx >= span.start and idx < span.end) return span;
+    }
+    return null;
+}
+
 fn positionFromIndex(text: []const u8, index: usize) TextPosition {
     var line: usize = 0;
     var col: usize = 0;
@@ -772,6 +816,41 @@ fn expandPlaceholderValue(
         }
     }
     return null;
+}
+
+fn tomlValueStringExpanded(
+    allocator: std.mem.Allocator,
+    value: toml.Value,
+    placeholders: []const jade.Placeholder,
+    root: toml.Table,
+) anyerror![]const u8 {
+    switch (value) {
+        .array => |ar| {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.appendSlice(allocator, "[ ");
+            for (ar.items, 0..) |item, idx| {
+                if (idx > 0) try out.appendSlice(allocator, ", ");
+                if (expandPlaceholderValue(allocator, placeholders, root, item)) |expanded| {
+                    defer allocator.free(expanded);
+                    try out.appendSlice(allocator, expanded);
+                } else {
+                    const rendered = tomlValueString(allocator, item) orelse return error.OutOfMemory;
+                    defer allocator.free(rendered);
+                    try out.appendSlice(allocator, rendered);
+                }
+            }
+            try out.appendSlice(allocator, " ]");
+            return out.toOwnedSlice(allocator);
+        },
+        .table => |_| return tomlValueString(allocator, value) orelse return error.OutOfMemory,
+        else => {
+            if (expandPlaceholderValue(allocator, placeholders, root, value)) |expanded| {
+                return expanded;
+            }
+            return tomlValueString(allocator, value) orelse return error.OutOfMemory;
+        },
+    }
 }
 
 fn tomlValueString(allocator: std.mem.Allocator, value: toml.Value) ?[]const u8 {
@@ -854,6 +933,23 @@ fn tableHeaderInfo(allocator: std.mem.Allocator, text: []const u8, line: usize) 
     return .{ .name = name, .index = idx };
 }
 
+fn arrayHeaderContext(allocator: std.mem.Allocator, text: []const u8, line: usize) ?ArrayContext {
+    if (line == 0) return null;
+    var idx: usize = line;
+    while (idx > 0) : (idx -= 1) {
+        const line_text = jade.lineSlice(text, idx - 1) orelse "";
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len >= 4 and trimmed[0] == '[' and trimmed[1] == '[' and trimmed[trimmed.len - 2] == ']') {
+            if (tableHeaderInfo(allocator, text, idx - 1)) |header| {
+                if (header.index) |index| {
+                    return .{ .name = header.name, .index = index };
+                }
+            }
+        }
+    }
+    return null;
+}
+
 fn countArrayHeaderIndex(allocator: std.mem.Allocator, text: []const u8, line: usize, target_path: []const []const u8) ?usize {
     var count: usize = 0;
     var idx: usize = 0;
@@ -904,7 +1000,7 @@ fn arrayItemInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, ch
             return .{
                 .path = combined,
                 .index = info.index,
-                .key = pathLastSegment(allocator, combined),
+                .key = formatArrayKeyName(allocator, combined, info.index),
                 .table = pathToTableName(allocator, combined),
             };
         }
@@ -944,7 +1040,7 @@ fn arrayItemInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, ch
     return .{
         .path = combined,
         .index = idx,
-        .key = pathLastSegment(allocator, combined),
+        .key = formatArrayKeyName(allocator, combined, idx),
         .table = pathToTableName(allocator, combined),
     };
 }
@@ -1062,7 +1158,186 @@ fn parseKeySegments(allocator: std.mem.Allocator, line_text: []const u8) ?[]KeyS
     return segments.toOwnedSlice(allocator) catch null;
 }
 
+const ElementRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn parseArrayElementRange(line_text: []const u8, index: usize) ?ElementRange {
+    var in_double = false;
+    var in_single = false;
+    var escape = false;
+
+    var eq_index: ?usize = null;
+    var i: usize = 0;
+    while (i < line_text.len) : (i += 1) {
+        const ch = line_text[i];
+        if (escape) {
+            escape = false;
+        } else if (in_double and ch == '\\') {
+            escape = true;
+        } else if (in_double) {
+            if (ch == '"') in_double = false;
+        } else if (in_single) {
+            if (ch == '\'') in_single = false;
+        } else {
+            if (ch == '"') {
+                in_double = true;
+            } else if (ch == '\'') {
+                in_single = true;
+            } else if (ch == '=') {
+                eq_index = i;
+                break;
+            }
+        }
+    }
+    if (eq_index == null) return null;
+    i = eq_index.? + 1;
+    while (i < line_text.len and (line_text[i] == ' ' or line_text[i] == '\t')) : (i += 1) {}
+    if (i >= line_text.len or line_text[i] != '[') return null;
+
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    in_double = false;
+    in_single = false;
+    escape = false;
+
+    var elem_index: usize = 0;
+    var elem_start: ?usize = null;
+    var elem_end: ?usize = null;
+
+    var j: usize = i;
+    while (j < line_text.len) : (j += 1) {
+        const ch = line_text[j];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_double) {
+            if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_double = false;
+            }
+            continue;
+        }
+        if (in_single) {
+            if (ch == '\'') in_single = false;
+            continue;
+        }
+
+        switch (ch) {
+            '"' => {
+                in_double = true;
+            },
+            '\'' => {
+                in_single = true;
+            },
+            '[' => {
+                bracket_depth += 1;
+                if (bracket_depth == 1) {
+                    elem_start = null;
+                    elem_end = null;
+                }
+            },
+            ']' => {
+                if (bracket_depth == 1) {
+                    if (elem_start != null) {
+                        elem_end = j;
+                    }
+                    if (elem_start != null and elem_end != null and elem_index == index) {
+                        return trimmedElementRange(line_text, elem_start.?, elem_end.?);
+                    }
+                }
+                if (bracket_depth > 0) bracket_depth -= 1;
+                if (bracket_depth == 0) break;
+            },
+            '{' => {
+                if (bracket_depth >= 1) brace_depth += 1;
+            },
+            '}' => {
+                if (brace_depth > 0) brace_depth -= 1;
+            },
+            ',' => {
+                if (bracket_depth == 1 and brace_depth == 0) {
+                    if (elem_start != null) {
+                        elem_end = j;
+                    }
+                    if (elem_start != null and elem_end != null and elem_index == index) {
+                        return trimmedElementRange(line_text, elem_start.?, elem_end.?);
+                    }
+                    elem_index += 1;
+                    elem_start = null;
+                    elem_end = null;
+                }
+            },
+            else => {},
+        }
+
+        if (bracket_depth == 1 and brace_depth == 0 and elem_start == null) {
+            if (ch != ' ' and ch != '\t' and ch != ',' and ch != ']') {
+                elem_start = j;
+            }
+        }
+    }
+    return null;
+}
+
+fn trimmedElementRange(line_text: []const u8, start: usize, end: usize) ElementRange {
+    var s = start;
+    var e = end;
+    while (s < e and (line_text[s] == ' ' or line_text[s] == '\t')) : (s += 1) {}
+    while (e > s and (line_text[e - 1] == ' ' or line_text[e - 1] == '\t')) : (e -= 1) {}
+    return .{ .start = s, .end = e };
+}
+
+fn findArrayElementRange(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    array_path: []const []const u8,
+    index: usize,
+) ?types.Range {
+    var current_path: [][]const u8 = allocator.alloc([]const u8, 0) catch return null;
+    defer allocator.free(current_path);
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len != 0 and trimmed[0] == '[') {
+            if (parseTableHeaderPath(allocator, trimmed)) |table_path| {
+                allocator.free(current_path);
+                current_path = table_path;
+            }
+        } else if (!isCommentOrEmpty(line_text)) {
+            if (parseKeySegments(allocator, line_text)) |segments| {
+                defer allocator.free(segments);
+                if (segments.len > 0) {
+                    const seg_path = segmentsToPath(allocator, segments) orelse return null;
+                    defer allocator.free(seg_path);
+                    const combined = joinPaths(allocator, current_path, seg_path) orelse return null;
+                    defer allocator.free(combined);
+                    if (pathEquals(combined, array_path)) {
+                        if (parseArrayElementRange(line_text, index)) |range| {
+                            return .{
+                                .start = .{ .line = @intCast(line_index), .character = @intCast(range.start) },
+                                .end = .{ .line = @intCast(line_index), .character = @intCast(range.end) },
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        line_index += 1;
+    }
+    return null;
+}
+
 fn findKeyDefinitionRange(allocator: std.mem.Allocator, text: []const u8, path: []const []const u8) ?types.Range {
+    if (arrayElementTarget(path)) |target| {
+        return findArrayElementRange(allocator, text, target.path, target.index);
+    }
+
     var current_path: [][]const u8 = allocator.alloc([]const u8, 0) catch return null;
     defer allocator.free(current_path);
 
@@ -1098,6 +1373,201 @@ fn findKeyDefinitionRange(allocator: std.mem.Allocator, text: []const u8, path: 
     return null;
 }
 
+fn collectKeyReferenceRanges(allocator: std.mem.Allocator, text: []const u8, path: []const []const u8) ?[]types.Range {
+    if (arrayElementTarget(path)) |target| {
+        return collectArrayElementReferenceRanges(allocator, text, target.path, target.index);
+    }
+
+    var ranges: std.ArrayList(types.Range) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    var current_path: [][]const u8 = allocator.alloc([]const u8, 0) catch return null;
+    defer allocator.free(current_path);
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len != 0 and trimmed[0] == '[') {
+            if (parseTableHeaderPath(allocator, trimmed)) |table_path| {
+                allocator.free(current_path);
+                current_path = table_path;
+            }
+        } else if (!isCommentOrEmpty(line_text)) {
+            if (parseKeySegments(allocator, line_text)) |segments| {
+                defer allocator.free(segments);
+                if (segments.len > 0) {
+                    const seg_path = segmentsToPath(allocator, segments) orelse return null;
+                    defer allocator.free(seg_path);
+                    const combined = joinPaths(allocator, current_path, seg_path) orelse return null;
+                    defer allocator.free(combined);
+                    if (pathEquals(combined, path)) {
+                        const last = segments[segments.len - 1];
+                        ranges.append(allocator, .{
+                            .start = .{ .line = @intCast(line_index), .character = @intCast(last.start) },
+                            .end = .{ .line = @intCast(line_index), .character = @intCast(last.end) },
+                        }) catch {};
+                    }
+
+                    if (inlineKeyRangesForLine(allocator, line_text, line_index, current_path, seg_path)) |inline_ranges| {
+                        defer allocator.free(inline_ranges);
+                        for (inline_ranges) |entry| {
+                            if (pathEquals(entry.path, path)) {
+                                ranges.append(allocator, entry.range) catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        line_index += 1;
+    }
+
+    return ranges.toOwnedSlice(allocator) catch null;
+}
+
+fn collectArrayElementReferenceRanges(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    array_path: []const []const u8,
+    index: usize,
+) ?[]types.Range {
+    var ranges: std.ArrayList(types.Range) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    var current_path: [][]const u8 = allocator.alloc([]const u8, 0) catch return null;
+    defer allocator.free(current_path);
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len != 0 and trimmed[0] == '[') {
+            if (parseTableHeaderPath(allocator, trimmed)) |table_path| {
+                allocator.free(current_path);
+                current_path = table_path;
+            }
+        } else if (!isCommentOrEmpty(line_text)) {
+            if (parseKeySegments(allocator, line_text)) |segments| {
+                defer allocator.free(segments);
+                if (segments.len > 0) {
+                    const seg_path = segmentsToPath(allocator, segments) orelse return null;
+                    defer allocator.free(seg_path);
+                    const combined = joinPaths(allocator, current_path, seg_path) orelse return null;
+                    defer allocator.free(combined);
+                    if (pathEquals(combined, array_path)) {
+                        if (parseArrayElementRange(line_text, index)) |range| {
+                            ranges.append(allocator, .{
+                                .start = .{ .line = @intCast(line_index), .character = @intCast(range.start) },
+                                .end = .{ .line = @intCast(line_index), .character = @intCast(range.end) },
+                            }) catch return null;
+                        }
+                    }
+                }
+            }
+        }
+        line_index += 1;
+    }
+
+    return ranges.toOwnedSlice(allocator) catch null;
+}
+
+const InlineKeyRange = struct {
+    path: [][]const u8,
+    range: types.Range,
+};
+
+fn inlineKeyRangesForLine(
+    allocator: std.mem.Allocator,
+    line_text: []const u8,
+    line_index: usize,
+    table_path: []const []const u8,
+    outer_path: []const []const u8,
+) ?[]InlineKeyRange {
+    const eq_index = std.mem.indexOfScalar(u8, line_text, '=') orelse return null;
+    const value_part = line_text[eq_index + 1 ..];
+    const brace_open_rel = std.mem.indexOfScalar(u8, value_part, '{') orelse return null;
+    const brace_close_rel = std.mem.lastIndexOfScalar(u8, value_part, '}') orelse return null;
+    if (brace_close_rel <= brace_open_rel) return null;
+
+    const brace_open = eq_index + 1 + brace_open_rel;
+    const inside = value_part[brace_open_rel + 1 .. brace_close_rel];
+
+    var ranges: std.ArrayList(InlineKeyRange) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    var depth: usize = 0;
+    var seg_start: usize = 0;
+    var idx: usize = 0;
+    while (idx <= inside.len) : (idx += 1) {
+        const at_end = idx == inside.len;
+        const ch = if (at_end) ',' else inside[idx];
+        if (!at_end) {
+            if (ch == '{') depth += 1;
+            if (ch == '}') {
+                if (depth > 0) depth -= 1;
+            }
+        }
+        if (at_end or (ch == ',' and depth == 0)) {
+            const seg_raw = inside[seg_start..idx];
+            const seg = std.mem.trim(u8, seg_raw, " \t");
+            if (seg.len > 0) {
+                const seg_eq = std.mem.indexOfScalar(u8, seg, '=') orelse {
+                    seg_start = idx + 1;
+                    continue;
+                };
+                const key_part = std.mem.trim(u8, seg[0..seg_eq], " \t");
+                const key_path = splitDottedPath(allocator, key_part) orelse {
+                    seg_start = idx + 1;
+                    continue;
+                };
+                defer allocator.free(key_path);
+
+                const combined_outer = joinPaths(allocator, table_path, outer_path) orelse return null;
+                defer allocator.free(combined_outer);
+                const combined = joinPaths(allocator, combined_outer, key_path) orelse return null;
+
+                var lead: usize = 0;
+                while (lead < seg_raw.len and (seg_raw[lead] == ' ' or seg_raw[lead] == '\t')) : (lead += 1) {}
+                const key_start = brace_open + seg_start + lead;
+                const key_end = key_start + key_part.len;
+                ranges.append(allocator, .{
+                    .path = combined,
+                    .range = .{
+                        .start = .{ .line = @intCast(line_index), .character = @intCast(key_start) },
+                        .end = .{ .line = @intCast(line_index), .character = @intCast(key_end) },
+                    },
+                }) catch {};
+            }
+            seg_start = idx + 1;
+        }
+    }
+
+    if (ranges.items.len == 0) return null;
+    return ranges.toOwnedSlice(allocator) catch null;
+}
+
+fn collectTemplateReferenceRanges(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    spans: []const jade.TemplateSpan,
+    path: []const []const u8,
+) ?[]types.Range {
+    var ranges: std.ArrayList(types.Range) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    for (spans) |span| {
+        if (extractTemplatePath(allocator, text, span)) |tpl_path| {
+            defer allocator.free(tpl_path);
+            if (pathEquals(tpl_path, path)) {
+                ranges.append(allocator, rangeFromSpan(text, span.start, span.end)) catch {};
+            }
+        }
+    }
+
+    return ranges.toOwnedSlice(allocator) catch null;
+}
+
 fn segmentsToPath(allocator: std.mem.Allocator, segments: []const KeySegment) ?[][]const u8 {
     const out = allocator.alloc([]const u8, segments.len) catch return null;
     for (segments, 0..) |seg, idx| {
@@ -1128,6 +1598,11 @@ fn pathToKeyName(allocator: std.mem.Allocator, path: []const []const u8) ?[]cons
 
 fn pathLastSegment(allocator: std.mem.Allocator, path: []const []const u8) ?[]const u8 {
     return pathToKeyName(allocator, path);
+}
+
+fn formatArrayKeyName(allocator: std.mem.Allocator, path: []const []const u8, index: usize) ?[]const u8 {
+    if (path.len == 0) return allocator.dupe(u8, "") catch null;
+    return std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path[path.len - 1], index }) catch null;
 }
 
 fn inlineTableHoverInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, character: usize) ?InlineKeyInfo {
@@ -1667,7 +2142,7 @@ fn isCommentOrEmpty(line_text: []const u8) bool {
     return trimmed.len == 0 or trimmed[0] == '#';
 }
 
-fn joinPaths(allocator: std.mem.Allocator, a: [][]const u8, b: [][]const u8) ?[][]const u8 {
+fn joinPaths(allocator: std.mem.Allocator, a: []const []const u8, b: []const []const u8) ?[][]const u8 {
     const out = allocator.alloc([]const u8, a.len + b.len) catch return null;
     @memcpy(out[0..a.len], a);
     @memcpy(out[a.len..], b);
@@ -1730,14 +2205,39 @@ fn extractKeyPathAt(allocator: std.mem.Allocator, line_text: []const u8, charact
     return slice;
 }
 
+fn parseIndexSegment(seg: []const u8) ?usize {
+    if (seg.len == 0) return null;
+    for (seg) |ch| {
+        if (ch < '0' or ch > '9') return null;
+    }
+    return std.fmt.parseInt(usize, seg, 10) catch null;
+}
+
 fn lookupTomlValue(root: toml.Table, key_path: []const []const u8) ?toml.Value {
     var table = root;
-    for (key_path, 0..) |key, idx| {
+    var idx: usize = 0;
+    while (idx < key_path.len) : (idx += 1) {
+        const key = key_path[idx];
         const value = table.get(key) orelse return null;
         if (idx == key_path.len - 1) return value;
         switch (value) {
             .table => |t| table = t.*,
             .array => |ar| {
+                if (idx + 1 < key_path.len) {
+                    if (parseIndexSegment(key_path[idx + 1])) |array_index| {
+                        if (array_index >= ar.items.len) return null;
+                        const item = ar.items[array_index];
+                        if (idx + 1 == key_path.len - 1) return item;
+                        switch (item) {
+                            .table => |t| {
+                                table = t.*;
+                                idx += 1;
+                                continue;
+                            },
+                            else => return null,
+                        }
+                    }
+                }
                 if (tableFromArray(ar)) |t| {
                     table = t;
                 } else return null;
@@ -1746,6 +2246,69 @@ fn lookupTomlValue(root: toml.Table, key_path: []const []const u8) ?toml.Value {
         }
     }
     return null;
+}
+
+const ArrayContext = struct {
+    name: []const u8,
+    index: usize,
+};
+
+fn lookupTomlValueWithContext(root: toml.Table, key_path: []const []const u8, ctx: ?ArrayContext) ?toml.Value {
+    var table = root;
+    var idx: usize = 0;
+    while (idx < key_path.len) : (idx += 1) {
+        const key = key_path[idx];
+        const value = table.get(key) orelse return null;
+        if (idx == key_path.len - 1) return value;
+        switch (value) {
+            .table => |t| table = t.*,
+            .array => |ar| {
+                if (idx + 1 < key_path.len) {
+                    if (parseIndexSegment(key_path[idx + 1])) |array_index| {
+                        if (array_index >= ar.items.len) return null;
+                        const item = ar.items[array_index];
+                        if (idx + 1 == key_path.len - 1) return item;
+                        switch (item) {
+                            .table => |t| {
+                                table = t.*;
+                                idx += 1;
+                                continue;
+                            },
+                            else => return null,
+                        }
+                    }
+                }
+                if (ctx) |c| {
+                    if (std.mem.eql(u8, c.name, key) and c.index < ar.items.len) {
+                        const item = ar.items[c.index];
+                        switch (item) {
+                            .table => |t| {
+                                table = t.*;
+                                continue;
+                            },
+                            else => return null,
+                        }
+                    }
+                }
+                if (tableFromArray(ar)) |t| {
+                    table = t;
+                } else return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+const ArrayElementTarget = struct {
+    path: []const []const u8,
+    index: usize,
+};
+
+fn arrayElementTarget(path: []const []const u8) ?ArrayElementTarget {
+    if (path.len == 0) return null;
+    const index = parseIndexSegment(path[path.len - 1]) orelse return null;
+    return .{ .path = path[0 .. path.len - 1], .index = index };
 }
 
 fn tableFromArray(ar: *toml.ValueList) ?toml.Table {
@@ -1979,6 +2542,170 @@ test "hover marks templated values and resolves type" {
     defer allocator.free(info.key);
     defer allocator.free(info.table);
     try std.testing.expectEqualStrings("string", info.ty);
+}
+
+test "hover expands array values on key and shows array index on item" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        "[params]\n" ++
+        "port = 9000\n" ++
+        "[server]\n" ++
+        "ports = [ 8000, 8001, \"{{ params.port }}\" ]\n";
+
+    const span_mask = jade.maskJinja(allocator, text) catch return error.TestFailed;
+    defer allocator.free(span_mask.masked);
+    defer allocator.free(span_mask.spans);
+
+    const masked = jade.maskJinjaForFormat(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    const line_text = jade.lineSlice(text, 3) orelse return error.TestFailed;
+    const key_pos = std.mem.indexOf(u8, line_text, "ports") orelse return error.TestFailed;
+    var server: Server = undefined;
+    const key_hover = server.resolveHoverInfo(allocator, masked.masked, text, 3, key_pos, span_mask.spans, masked.placeholders) orelse return error.TestFailed;
+    defer allocator.free(key_hover.value);
+    defer allocator.free(key_hover.key);
+    defer allocator.free(key_hover.table);
+    try std.testing.expectEqualStrings("array", key_hover.ty);
+    try std.testing.expect(std.mem.indexOf(u8, key_hover.value, "9000") != null);
+
+    const item_pos = std.mem.indexOf(u8, line_text, "8001") orelse return error.TestFailed;
+    const item_hover = server.resolveHoverInfo(allocator, masked.masked, text, 3, item_pos, span_mask.spans, masked.placeholders) orelse return error.TestFailed;
+    defer allocator.free(item_hover.value);
+    defer allocator.free(item_hover.key);
+    defer allocator.free(item_hover.table);
+    try std.testing.expect(std.mem.indexOf(u8, item_hover.key, "[") != null);
+}
+
+test "hover resolves inline table keys" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        "[params]\n" ++
+        "retries = 2\n" ++
+        "[[services]]\n" ++
+        "config = { retries = \"{{ params.retries }}\", timeout = 30 }\n";
+
+    const span_mask = jade.maskJinja(allocator, text) catch return error.TestFailed;
+    defer allocator.free(span_mask.masked);
+    defer allocator.free(span_mask.spans);
+
+    const masked = jade.maskJinjaForFormat(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    const line_text = jade.lineSlice(text, 3) orelse return error.TestFailed;
+    const pos = std.mem.indexOf(u8, line_text, "retries") orelse return error.TestFailed;
+    var server: Server = undefined;
+    const info = server.resolveHoverInfo(allocator, masked.masked, text, 3, pos, span_mask.spans, masked.placeholders) orelse return error.TestFailed;
+    defer allocator.free(info.value);
+    defer allocator.free(info.key);
+    defer allocator.free(info.table);
+    try std.testing.expectEqualStrings("string", info.ty);
+    try std.testing.expect(std.mem.indexOf(u8, info.value, "2") != null);
+}
+
+test "collect references includes key and template usage" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        "title = \"{{ params.title }}\"\n" ++
+        "[params]\n" ++
+        "title = \"Example\"\n";
+
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    const path = splitDottedPath(allocator, "params.title") orelse return error.TestFailed;
+    defer allocator.free(path);
+
+    const key_ranges = collectKeyReferenceRanges(allocator, text, path) orelse return error.TestFailed;
+    defer allocator.free(key_ranges);
+    const tpl_ranges = collectTemplateReferenceRanges(allocator, text, spans, path) orelse return error.TestFailed;
+    defer allocator.free(tpl_ranges);
+
+    try std.testing.expect(key_ranges.len >= 1);
+    try std.testing.expect(tpl_ranges.len >= 1);
+}
+
+test "lookupTomlValue resolves array index segments" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\[params]
+        \\labels = ["alpha", "beta", "gamma"]
+        \\
+    ;
+    var parser = toml.Parser(toml.Table).init(allocator);
+    defer parser.deinit();
+    const parsed = parser.parseString(text) catch return error.TestFailed;
+    defer parsed.deinit();
+    const path = splitDottedPath(allocator, "params.labels.1") orelse return error.TestFailed;
+    defer allocator.free(path);
+    const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("beta", value.string);
+}
+
+test "array-of-tables hover resolves correct item per header" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        "[[services]]\n" ++
+        "name = \"web\"\n" ++
+        "[[services]]\n" ++
+        "name = \"worker\"\n";
+
+    const span_mask = jade.maskJinja(allocator, text) catch return error.TestFailed;
+    defer allocator.free(span_mask.masked);
+    defer allocator.free(span_mask.spans);
+
+    const masked = jade.maskJinjaForFormat(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    var server: Server = undefined;
+    const line0 = jade.lineSlice(text, 1) orelse return error.TestFailed;
+    const pos0 = std.mem.indexOf(u8, line0, "name") orelse return error.TestFailed;
+    const hover0 = server.resolveHoverInfo(allocator, masked.masked, text, 1, pos0, span_mask.spans, masked.placeholders) orelse return error.TestFailed;
+    defer allocator.free(hover0.value);
+    defer allocator.free(hover0.key);
+    defer allocator.free(hover0.table);
+    try std.testing.expect(std.mem.indexOf(u8, hover0.value, "web") != null);
+
+    const line1 = jade.lineSlice(text, 3) orelse return error.TestFailed;
+    const pos1 = std.mem.indexOf(u8, line1, "name") orelse return error.TestFailed;
+    const hover1 = server.resolveHoverInfo(allocator, masked.masked, text, 3, pos1, span_mask.spans, masked.placeholders) orelse return error.TestFailed;
+    defer allocator.free(hover1.value);
+    defer allocator.free(hover1.key);
+    defer allocator.free(hover1.table);
+    try std.testing.expect(std.mem.indexOf(u8, hover1.value, "worker") != null);
 }
 
 pub fn main() !void {
