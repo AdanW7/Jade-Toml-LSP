@@ -512,11 +512,13 @@ const Server = struct {
                     } else {
                         value_text = tomlValueStringExpanded(arena, item, placeholders, parsed.value) catch return null;
                     }
+                    const key_name = formatArrayKeyName(arena, array_info.path, array_info.index) orelse "";
+                    const table_name = tableNameWithArrayContext(arena, array_info.path, array_ctx) orelse "";
                     return .{
                         .ty = tomlValueType(item),
                         .value = value_text,
-                        .key = array_info.key orelse "",
-                        .table = array_info.table orelse "",
+                        .key = key_name,
+                        .table = table_name,
                     };
                 }
             }
@@ -538,11 +540,13 @@ const Server = struct {
             else
                 tomlValueStringExpanded(arena, value, placeholders, parsed.value) catch return null;
 
+            const key_name = pathToKeyName(arena, inline_info.path) orelse "";
+            const table_name = tableNameWithArrayContext(arena, inline_info.path, array_ctx) orelse "";
             return .{
                 .ty = tomlValueType(value),
                 .value = value_text,
-                .key = inline_info.key orelse "",
-                .table = inline_info.table orelse "",
+                .key = key_name,
+                .table = table_name,
             };
         }
 
@@ -553,7 +557,7 @@ const Server = struct {
         const value_text = tomlValueStringExpanded(arena, value, placeholders, parsed.value) catch return null;
 
         const key_name = pathToKeyName(arena, key_path) orelse "";
-        const table_name = pathToTableName(arena, key_path) orelse "";
+        const table_name = tableNameWithArrayContext(arena, key_path, array_ctx) orelse "";
 
         if (template_span) |span| {
             if (extractTemplatePath(arena, full_text, span)) |template_path| {
@@ -1000,8 +1004,8 @@ fn arrayItemInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, ch
             return .{
                 .path = combined,
                 .index = info.index,
-                .key = formatArrayKeyName(allocator, combined, info.index),
-                .table = pathToTableName(allocator, combined),
+                .key = null,
+                .table = null,
             };
         }
         return null;
@@ -1040,8 +1044,8 @@ fn arrayItemInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, ch
     return .{
         .path = combined,
         .index = idx,
-        .key = formatArrayKeyName(allocator, combined, idx),
-        .table = pathToTableName(allocator, combined),
+        .key = null,
+        .table = null,
     };
 }
 
@@ -1365,6 +1369,14 @@ fn findKeyDefinitionRange(allocator: std.mem.Allocator, text: []const u8, path: 
                             .end = .{ .line = @intCast(line_index), .character = @intCast(last.end) },
                         };
                     }
+                    if (inlineKeyRangesForLine(allocator, line_text, line_index, current_path, seg_path)) |inline_ranges| {
+                        defer freeInlineKeyRanges(allocator, inline_ranges);
+                        for (inline_ranges) |entry| {
+                            if (pathEquals(entry.path, path)) {
+                                return entry.range;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1410,7 +1422,7 @@ fn collectKeyReferenceRanges(allocator: std.mem.Allocator, text: []const u8, pat
                     }
 
                     if (inlineKeyRangesForLine(allocator, line_text, line_index, current_path, seg_path)) |inline_ranges| {
-                        defer allocator.free(inline_ranges);
+                        defer freeInlineKeyRanges(allocator, inline_ranges);
                         for (inline_ranges) |entry| {
                             if (pathEquals(entry.path, path)) {
                                 ranges.append(allocator, entry.range) catch {};
@@ -1476,6 +1488,13 @@ const InlineKeyRange = struct {
     path: [][]const u8,
     range: types.Range,
 };
+
+fn freeInlineKeyRanges(allocator: std.mem.Allocator, ranges: []InlineKeyRange) void {
+    for (ranges) |entry| {
+        allocator.free(entry.path);
+    }
+    allocator.free(ranges);
+}
 
 fn inlineKeyRangesForLine(
     allocator: std.mem.Allocator,
@@ -1605,6 +1624,35 @@ fn formatArrayKeyName(allocator: std.mem.Allocator, path: []const []const u8, in
     return std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path[path.len - 1], index }) catch null;
 }
 
+fn tableNameWithArrayContext(
+    allocator: std.mem.Allocator,
+    path: []const []const u8,
+    ctx: ?ArrayContext,
+) ?[]const u8 {
+    if (path.len <= 1) {
+        return allocator.dupe(u8, "root") catch null;
+    }
+    const end_index = path.len - 1;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var used_ctx = false;
+    for (path[0..end_index], 0..) |segment, idx| {
+        if (idx > 0) out.append(allocator, '.') catch return null;
+        if (ctx) |c| {
+            if (!used_ctx and std.mem.eql(u8, c.name, segment)) {
+                const seg = std.fmt.allocPrint(allocator, "{s}[{d}]", .{ segment, c.index }) catch return null;
+                defer allocator.free(seg);
+                out.appendSlice(allocator, seg) catch return null;
+                used_ctx = true;
+                continue;
+            }
+        }
+        out.appendSlice(allocator, segment) catch return null;
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
 fn inlineTableHoverInfo(allocator: std.mem.Allocator, text: []const u8, line: usize, character: usize) ?InlineKeyInfo {
     const line_text = jade.lineSlice(text, line) orelse return null;
     const eq_index = std.mem.indexOfScalar(u8, line_text, '=') orelse return null;
@@ -1634,8 +1682,8 @@ fn inlineTableHoverInfo(allocator: std.mem.Allocator, text: []const u8, line: us
     const combined = joinPaths(allocator, combined_outer, inline_path) orelse return null;
     return .{
         .path = combined,
-        .key = pathLastSegment(allocator, combined),
-        .table = pathToTableName(allocator, combined),
+        .key = null,
+        .table = null,
     };
 }
 
@@ -2699,6 +2747,21 @@ test "lookupTomlValue resolves array index segments" {
         const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
         try std.testing.expectEqualStrings("gamma", value.string);
     }
+}
+
+test "definition finds inline table keys" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\[params]
+        \\limits = { min = 1, max = 5 }
+        \\[server]
+        \\config = { min = "{{ params.limits.min }}" }
+        \\
+    ;
+    const path = splitDottedPath(allocator, "params.limits.min") orelse return error.TestFailed;
+    defer allocator.free(path);
+    const range = findKeyDefinitionRange(allocator, text, path) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(i64, 1), range.start.line);
 }
 
 test "array-of-tables hover resolves correct item per header" {
