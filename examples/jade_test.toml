@@ -1,14 +1,66 @@
 title = "{{ params.title }}"
+# " this is " comment
+# {{ params.missing_in_comment }}
 
+# ---- Basic strings and escapes ----
+basic = "Simple string"
+literal = 'C:\Users\nodejs\templates'
+# multiline_basic = """
+# Roses are red
+# Violets are blue"""
+# multiline_basic_trimmed = """\
+# The quick brown \
+# fox jumps over \
+# the lazy dog.\
+# """
+# multiline_literal = '''
+# The first newline is
+# trimmed in raw strings.
+#    All other whitespace
+#    is preserved.
+# '''
+quoted_key_value = "value"
+"127.0.0.1" = "quoted key"
+'quoted "value"' = "quoted key with quotes"
+# "" = "blank key" # allowed by spec but rejected by some parsers
 [params]
 title = "Example"
 port = 9000
 retries = 2
-labels = ["alpha", "beta", "gamma"]
+labels = [
+    "alpha",
+    "beta",
+    "gamma",
+]
 owners = ["alice", "bob"]
 thresholds = [1, 2, 3]
 limits = { min = 1, max = 5 }
 flags = { enabled = true, limit = 3, note = "{{ params.title }}" }
+
+# ---- Numbers, booleans, and special floats ----
+int_pos = +99
+int_neg = -17
+int_underscore = 1_000_000
+hex = 0xDEADBEEF
+oct = 0o755
+bin = 0b11010110
+float_simple = 3.1415
+float_exp = 5e+22
+float_exp_neg = -2E-2
+float_sep = 224_617.445_991_228
+# float_inf = inf # spec-valid, but zig-toml doesn't parse these yet
+# float_nan = nan
+bool_true = true
+bool_false = false
+
+# ---- Date/time ----
+odt = 1979-05-27T07:32:00Z
+odt_space = 1979-05-27 07:32:00-07:00
+odt_frac = 1979-05-27T00:32:00.999999-07:00
+ldt = 1979-05-27T07:32:00
+ld = 1979-05-27
+lt = 07:32:00
+lt_frac = 00:32:00.999999
 
 [server]
 host = "127.0.0.1"
@@ -16,18 +68,99 @@ ports = [8000, 8001, "{{ params.port }}"]
 aliases = ["{{ params.labels.0 }}", "edge"]
 meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners[0] }}" }
 self_alias = "{{ server.aliases.0 }}"
-cyle_base = "{{ server.cyle_ref}}"
-cyle_ref = "{{ server.cyle_base }}"
+# cyle_base = "{{ server.cyle_ref}}"
+# cyle_ref = "{{ server.cyle_base }}"
+inline_bad = { "{{ params.bad_key }}" = 1 }
+
+# array of inline tables
+points = [ { x = 1, y = 2, z = 3 }, { x = 7, y = 8, z = 9 }, { x = 2, y = 4, z = 8 } ]
+
+# dotted keys create tables
+fruit.type = "fruit"
+fruit.skin = "thin"
+fruit.color = "red"
+fruit.orange = 2
+
+# invalid header template (diagnostic)
+["{{ params.section }}"]
+value = "bad header"
 
 [[services]]
 name = "web"
 config = { timeout = 30, retries = "{{ params.retries }}" }
 owner = "{{ params.owners.0 }}"
-tags = ["http", "primary", "{{ params.labels[1] }}"]
+tags = [
+    "http",
+    "primary",
+    "{{ params.labels[1] }}",
+]
 limits = { min = "{{ params.limits.min }}", max = "{{ params.limits.max }}" }
+
+# template in key (diagnostic)
+"{{ params.key }}" = "bad key"
 
 [[services]]
 name = "worker"
 config = { timeout = 60, retries = 1 }
 owner = "{{ params.owners.1 }}"
-tags = ["queue", "bg", "{{ params.labels.2 }}"]
+tags = [
+    "queue",
+    "bg",
+    "{{ params.labels.2 }}",
+]
+
+# ---- Array of tables + subtables ----
+[[products]]
+name = "Hammer"
+sku = 738594937
+
+[[products]]
+name = "Nail"
+sku = 284758393
+color = "gray"
+
+[products.meta]
+warehouse = "A1"
+
+[[fruits]]
+name = "apple"
+
+[fruits.physical]
+color = "red"
+shape = "round"
+
+[[fruits.varieties]]
+name = "red delicious"
+
+[[fruits.varieties]]
+name = "granny smith"
+
+[[fruits]]
+name = "banana"
+
+[[fruits.varieties]]
+name = "plantain"
+
+# ---- Inline tables ----
+[product]
+type = { name = "Nail" }
+
+# ---- Spec examples (commented out, parser limitations) ----
+# basic = "I'm a string. \"You can quote me\". Name\tJose\nLocation\tSF."
+# unicode_escape = "Jos\u00E9"
+# multiline_basic = """Roses are red"""
+# multiline_literal = '''raw'''
+
+# ---- Invalid examples (commented out) ----
+# name = "Tom" name = "Pradyun" # invalid: multiple kv on line
+# key = # invalid: missing value
+# invalid_float_1 = .7
+# invalid_float_2 = 7.
+# invalid_float_3 = 3.e+20
+# float_inf = inf
+# float_nan = nan
+# [fruit]
+# [[fruit]] # invalid: table vs array
+# fruits = []
+# [[fruits]] # invalid: append to static array
+# point = { x = 1, y = 2, } # invalid: inline table trailing comma

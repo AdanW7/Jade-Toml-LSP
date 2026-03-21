@@ -20,10 +20,18 @@ const DiagnosticsSettings = struct {
     templates: TemplateDiagnosticsSettings = .{},
 };
 
+const FormatSettings = struct {
+    enabled: bool = true,
+    respect_trailing_commas: bool = false,
+};
+
 const TemplateDiagnosticsSettings = struct {
     outside_quotes: DiagnosticsRule = .{ .severity = .err },
     missing_key: DiagnosticsRule = .{ .severity = .warn },
     cycle: DiagnosticsRule = .{ .severity = .warn },
+    in_keys: DiagnosticsRule = .{ .severity = .err },
+    inline_keys: DiagnosticsRule = .{ .severity = .err },
+    in_headers: DiagnosticsRule = .{ .severity = .err },
 };
 
 const DiagnosticsRule = struct {
@@ -33,7 +41,7 @@ const DiagnosticsRule = struct {
 
 const Settings = struct {
     diagnostics: DiagnosticsSettings = .{},
-    format: bool = true,
+    format: FormatSettings = .{},
 };
 
 const Server = struct {
@@ -118,10 +126,10 @@ const Server = struct {
         if (!isTomlUri(uri)) return null;
         var settings = handler.settings;
         applyTomlSettingsForUri(handler.allocator, uri, &settings);
-        if (!settings.format) return null;
+        if (!settings.format.enabled) return null;
 
         const text = handler.docs.get(uri) orelse return null;
-        const formatted = handler.formatToml(arena, text) orelse return null;
+        const formatted = handler.formatToml(arena, text, settings.format) orelse return null;
 
         const range = fullDocumentRange(text);
         const edit: types.TextEdit = .{
@@ -140,10 +148,10 @@ const Server = struct {
         if (!isTomlUri(uri)) return null;
         var settings = handler.settings;
         applyTomlSettingsForUri(handler.allocator, uri, &settings);
-        if (!settings.format) return null;
+        if (!settings.format.enabled) return null;
 
         const text = handler.docs.get(uri) orelse return null;
-        const formatted = handler.formatToml(arena, text) orelse return null;
+        const formatted = handler.formatToml(arena, text, settings.format) orelse return null;
 
         const range = fullDocumentRange(text);
         const edit: types.TextEdit = .{
@@ -188,10 +196,10 @@ const Server = struct {
         if (!isTomlUri(uri)) return null;
         var settings = handler.settings;
         applyTomlSettingsForUri(handler.allocator, uri, &settings);
-        if (!settings.format) return null;
+        if (!settings.format.enabled) return null;
 
         const text = handler.docs.get(uri) orelse return null;
-        const formatted = handler.formatToml(arena, text) orelse return null;
+        const formatted = handler.formatToml(arena, text, settings.format) orelse return null;
 
         const range = fullDocumentRange(text);
         const edit: types.TextEdit = .{
@@ -235,7 +243,7 @@ const Server = struct {
         defer arena.free(span_mask.masked);
         defer arena.free(span_mask.spans);
 
-        const format_mask = jade.maskJinjaForFormat(arena, text) catch return null;
+        const format_mask = jade.maskJinjaForFormatLenient(arena, text) catch return null;
         defer arena.free(format_mask.masked);
         defer {
             for (format_mask.placeholders) |ph| {
@@ -367,14 +375,14 @@ const Server = struct {
         defer handler.allocator.free(masked.masked);
         defer handler.allocator.free(masked.spans);
 
-        const masked_format = jade.maskJinjaForFormat(handler.allocator, text) catch return;
-        defer handler.allocator.free(masked_format.masked);
+        const masked_lenient = jade.maskJinjaForFormatLenient(handler.allocator, text) catch return;
+        defer handler.allocator.free(masked_lenient.masked);
         defer {
-            for (masked_format.placeholders) |ph| {
+            for (masked_lenient.placeholders) |ph| {
                 handler.allocator.free(ph.token);
                 handler.allocator.free(ph.original);
             }
-            handler.allocator.free(masked_format.placeholders);
+            handler.allocator.free(masked_lenient.placeholders);
         }
 
         const template_spans = jade.templateSpans(handler.allocator, text) catch return;
@@ -390,10 +398,29 @@ const Server = struct {
             allocated_messages.deinit(handler.allocator);
         }
 
+        if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+            std.debug.print("jade diagnostics: spans={d} uri={s}\n", .{ template_spans.len, uri });
+            if (jade.lineSlice(text, 0)) |lt| {
+                const span = jade.errorSpan(lt, 0);
+                const message = std.fmt.allocPrint(handler.allocator, "jade debug diagnostic", .{}) catch return;
+                allocated_messages.append(handler.allocator, message) catch return;
+                diagnostics.append(handler.allocator, .{
+                    .range = .{
+                        .start = .{ .line = 0, .character = @intCast(span.start) },
+                        .end = .{ .line = 0, .character = @intCast(span.end) },
+                    },
+                    .severity = .Information,
+                    .source = "jade",
+                    .message = message,
+                }) catch {};
+            }
+        }
+
         if (isTomlUri(uri)) {
             if (settings.diagnostics.templates.outside_quotes.enabled) {
                 for (template_spans) |span| {
                     if (span.in_quotes) continue;
+                    if (spanInLineComment(text, span)) continue;
                     if (templateOutsideQuotesDiagnostic(
                         handler.allocator,
                         text,
@@ -406,10 +433,51 @@ const Server = struct {
                 }
             }
 
+            if (settings.diagnostics.templates.in_headers.enabled or settings.diagnostics.templates.inline_keys.enabled or settings.diagnostics.templates.in_keys.enabled) {
+                for (template_spans) |span| {
+                    if (spanInLineComment(text, span)) continue;
+                    if (settings.diagnostics.templates.in_headers.enabled and templateSpanInTableHeader(text, span)) {
+                        if (templateHeaderDiagnostic(
+                            handler.allocator,
+                            text,
+                            span,
+                            settings.diagnostics.templates.in_headers.severity,
+                            &allocated_messages,
+                        )) |diag| {
+                            diagnostics.append(handler.allocator, diag) catch {};
+                        }
+                        continue;
+                    }
+                    if (settings.diagnostics.templates.inline_keys.enabled and templateSpanInInlineTableKey(handler.allocator, text, span)) {
+                        if (templateInlineKeyDiagnostic(
+                            handler.allocator,
+                            text,
+                            span,
+                            settings.diagnostics.templates.inline_keys.severity,
+                            &allocated_messages,
+                        )) |diag| {
+                            diagnostics.append(handler.allocator, diag) catch {};
+                        }
+                        continue;
+                    }
+                    if (settings.diagnostics.templates.in_keys.enabled and templateSpanInAssignmentKey(text, span)) {
+                        if (templateKeyDiagnostic(
+                            handler.allocator,
+                            text,
+                            span,
+                            settings.diagnostics.templates.in_keys.severity,
+                            &allocated_messages,
+                        )) |diag| {
+                            diagnostics.append(handler.allocator, diag) catch {};
+                        }
+                    }
+                }
+            }
+
             var parser = toml.Parser(toml.Table).init(handler.allocator);
             defer parser.deinit();
 
-            const parsed = parser.parseString(masked.masked) catch |err| {
+            const parsed = parser.parseString(masked_lenient.masked) catch |err| {
                 if (parser.error_info) |info| {
                     switch (info) {
                         .parse => |pos| {
@@ -439,6 +507,10 @@ const Server = struct {
             if (settings.diagnostics.templates.missing_key.enabled) {
                 for (template_spans) |span| {
                     if (!span.in_quotes) continue;
+                    if (spanInLineComment(text, span)) continue;
+                    if (templateSpanInTableHeader(text, span)) continue;
+                    if (templateSpanInAssignmentKey(text, span)) continue;
+                    if (templateSpanInInlineTableKey(handler.allocator, text, span)) continue;
                     if (templateMissingKeyDiagnostic(
                         handler.allocator,
                         text,
@@ -455,7 +527,7 @@ const Server = struct {
             if (settings.diagnostics.templates.cycle.enabled) {
                 var cycle_parser = toml.Parser(toml.Table).init(handler.allocator);
                 defer cycle_parser.deinit();
-                const cycle_parsed = cycle_parser.parseString(masked_format.masked) catch {
+                const cycle_parsed = cycle_parser.parseString(masked_lenient.masked) catch {
                     handler.publishDiagnostics(uri, diagnostics.items);
                     return;
                 };
@@ -463,12 +535,13 @@ const Server = struct {
 
                 for (template_spans) |span| {
                     if (!span.in_quotes) continue;
+                    if (spanInLineComment(text, span)) continue;
                     if (templateCycleDiagnostic(
                         handler.allocator,
                         text,
                         span,
                         cycle_parsed.value,
-                        masked_format.placeholders,
+                        masked_lenient.placeholders,
                         settings.diagnostics.templates.cycle.severity,
                         &allocated_messages,
                     )) |diag| {
@@ -476,6 +549,58 @@ const Server = struct {
                     }
                 }
             }
+
+            if (collectKeyConflictDiagnostics(
+                handler.allocator,
+                text,
+                settings.diagnostics.severity,
+                &allocated_messages,
+            )) |conflicts| {
+                defer handler.allocator.free(conflicts);
+                for (conflicts) |diag| {
+                    diagnostics.append(handler.allocator, diag) catch {};
+                }
+            }
+
+            if (collectInlineTableDiagnostics(
+                handler.allocator,
+                text,
+                settings.diagnostics.severity,
+                &allocated_messages,
+            )) |inline_diags| {
+                defer handler.allocator.free(inline_diags);
+                for (inline_diags) |diag| {
+                    diagnostics.append(handler.allocator, diag) catch {};
+                }
+            }
+
+            if (collectCommentControlCharDiagnostics(
+                handler.allocator,
+                text,
+                settings.diagnostics.severity,
+                &allocated_messages,
+            )) |comment_diags| {
+                defer handler.allocator.free(comment_diags);
+                for (comment_diags) |diag| {
+                    diagnostics.append(handler.allocator, diag) catch {};
+                }
+            }
+
+            if (collectArrayTableOrderingDiagnostics(
+                handler.allocator,
+                text,
+                settings.diagnostics.severity,
+                &allocated_messages,
+            )) |order_diags| {
+                defer handler.allocator.free(order_diags);
+                for (order_diags) |diag| {
+                    diagnostics.append(handler.allocator, diag) catch {};
+                }
+            }
+        }
+
+        if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+            std.debug.print("jade diagnostics: count={d} uri={s}\n", .{ diagnostics.items.len, uri });
         }
 
         handler.publishDiagnostics(uri, diagnostics.items);
@@ -493,12 +618,16 @@ const Server = struct {
             types.PublishDiagnosticsParams,
             payload,
             .{ .emit_null_optional_fields = false },
-        ) catch {};
+        ) catch |err| {
+            if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+                std.debug.print("jade publish diagnostics error: {s}\n", .{@errorName(err)});
+            }
+        };
     }
 
-    fn formatToml(handler: *Server, allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
+    fn formatToml(handler: *Server, allocator: std.mem.Allocator, text: []const u8, format_settings: FormatSettings) ?[]u8 {
         _ = handler;
-        return formatTomlText(allocator, text);
+        return formatTomlText(allocator, text, format_settings);
     }
 
     fn resolveHoverInfo(
@@ -647,7 +776,7 @@ fn templatedTomlDiagnostic(
     const character = if (pos.pos > 0) pos.pos - 1 else 0;
     const line_text = jade.lineSlice(text, line) orelse "";
     const span = jade.errorSpan(line_text, character);
-    const message = try std.fmt.allocPrint(allocator, "TOML parse error: {s}", .{@errorName(err)});
+    const message = try std.fmt.allocPrint(allocator, "TOML parse error: {s}", .{parseErrorMessage(err)});
     try allocated_messages.append(allocator, message);
 
     return .{
@@ -658,6 +787,29 @@ fn templatedTomlDiagnostic(
         .severity = diagnosticSeverityToLsp(severity),
         .source = "jade",
         .message = message,
+    };
+}
+
+fn parseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnexpectedToken => "Unexpected token",
+        error.UnexpectedEOF => "Unexpected end of file",
+        error.InvalidCharacter => "Invalid character",
+        error.InvalidEscape => "Invalid escape sequence",
+        error.InvalidUnicode => "Invalid unicode escape",
+        error.UnexpectedMultilineString => "Unexpected multiline string",
+        error.CannotParseValue => "Cannot parse value",
+        error.FieldTypeRedifinition => "Key redefined with a different type",
+        error.InvalidTimeOffset => "Invalid time offset",
+        error.InvalidTime => "Invalid time",
+        error.InvalidYear => "Invalid year",
+        error.InvalidMonth => "Invalid month",
+        error.InvalidDay => "Invalid day",
+        error.InvalidHour => "Invalid hour",
+        error.InvalidMinute => "Invalid minute",
+        error.InvalidSecond => "Invalid second",
+        error.InvalidNanoSecond => "Invalid fractional seconds",
+        else => @errorName(err),
     };
 }
 
@@ -741,6 +893,42 @@ fn isTomlUri(uri: []const u8) bool {
     return std.mem.endsWith(u8, uri, ".toml");
 }
 
+fn spanInLineComment(text: []const u8, span: jade.TemplateSpan) bool {
+    if (span.start >= text.len) return false;
+
+    const last_nl = std.mem.lastIndexOfScalar(u8, text[0..span.start], '\n');
+    const line_start: usize = if (last_nl) |pos| pos + 1 else 0;
+    var line_end: usize = span.start;
+    while (line_end < text.len and text[line_end] != '\n') : (line_end += 1) {}
+
+    var state: jade.QuoteState = .none;
+    var i: usize = 0;
+    while (i < line_start and i < text.len) : (i += 1) {
+        jade.updateQuoteState(text, &i, &state);
+    }
+
+    if (state == .multi_double or state == .multi_single) {
+        return false;
+    }
+
+    // If the first non-whitespace char on the line is '#', the whole line is a comment.
+    i = line_start;
+    while (i < line_end) : (i += 1) {
+        if (text[i] == ' ' or text[i] == '\t') continue;
+        if (text[i] == '#') return true;
+        break;
+    }
+
+    // Otherwise, look for an inline comment before the span.
+    i = line_start;
+    while (i < span.start) : (i += 1) {
+        jade.updateQuoteState(text, &i, &state);
+        if (state == .none and text[i] == '#') return true;
+    }
+
+    return false;
+}
+
 fn fullDocumentRange(text: []const u8) types.Range {
     const info = jade.lineInfo(text);
     const end_line = if (info.lines > 0) info.lines - 1 else 0;
@@ -748,6 +936,521 @@ fn fullDocumentRange(text: []const u8) types.Range {
         .start = .{ .line = 0, .character = 0 },
         .end = .{ .line = @intCast(end_line), .character = @intCast(info.last_line_len) },
     };
+}
+
+const PathKind = enum { table, array, value };
+fn pathHasPrefix(path: []const []const u8, prefix: []const []const u8) bool {
+    if (prefix.len > path.len) return false;
+    for (prefix, 0..) |part, idx| {
+        if (!std.mem.eql(u8, part, path[idx])) return false;
+    }
+    return true;
+}
+
+fn collectKeyConflictDiagnostics(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?[]types.Diagnostic {
+    var diags: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
+
+    var kinds = std.StringHashMap(PathKind).init(allocator);
+    defer {
+        var it = kinds.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
+        kinds.deinit();
+    }
+
+    var array_element_maps = std.StringHashMap(*std.StringHashMap(PathKind)).init(allocator);
+    defer {
+        var it = array_element_maps.iterator();
+        while (it.next()) |entry| {
+            const map_ptr = entry.value_ptr.*;
+            var mit = map_ptr.iterator();
+            while (mit.next()) |mentry| {
+                allocator.free(mentry.key_ptr.*);
+            }
+            map_ptr.deinit();
+            allocator.destroy(map_ptr);
+            allocator.free(entry.key_ptr.*);
+        }
+        array_element_maps.deinit();
+    }
+
+    var current_path: [][]const u8 = allocator.alloc([]const u8, 0) catch return null;
+    defer allocator.free(current_path);
+    var current_array_path: ?[][]const u8 = null;
+    defer if (current_array_path) |path| allocator.free(path);
+    var current_array_map: ?*std.StringHashMap(PathKind) = null;
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            line_index += 1;
+            continue;
+        }
+
+        if (trimmed[0] == '[') {
+            if (parseTableHeaderPath(allocator, trimmed)) |header_path| {
+                const is_array = trimmed.len >= 4 and trimmed[0] == '[' and trimmed[1] == '[' and trimmed[trimmed.len - 2] == ']';
+                defer allocator.free(header_path);
+
+                if (current_array_path) |path| {
+                    if (!pathHasPrefix(header_path, path)) {
+                        allocator.free(path);
+                        current_array_path = null;
+                        current_array_map = null;
+                    }
+                }
+
+                allocator.free(current_path);
+                current_path = allocator.alloc([]const u8, header_path.len) catch return null;
+                @memcpy(current_path, header_path);
+                if (is_array) {
+                    if (current_array_path) |path| allocator.free(path);
+                    current_array_path = allocator.alloc([]const u8, header_path.len) catch return null;
+                    @memcpy(current_array_path.?, header_path);
+
+                    const array_key = joinPathForMessage(allocator, header_path) catch return null;
+                    defer allocator.free(array_key);
+                    if (array_element_maps.getEntry(array_key)) |entry| {
+                        const map_ptr = entry.value_ptr.*;
+                        var mit = map_ptr.iterator();
+                        while (mit.next()) |mentry| {
+                            allocator.free(mentry.key_ptr.*);
+                        }
+                        map_ptr.deinit();
+                        map_ptr.* = std.StringHashMap(PathKind).init(allocator);
+                        current_array_map = map_ptr;
+                    } else {
+                        const map_ptr = allocator.create(std.StringHashMap(PathKind)) catch return null;
+                        map_ptr.* = std.StringHashMap(PathKind).init(allocator);
+                        const stored_key = allocator.dupe(u8, array_key) catch return null;
+                        array_element_maps.put(stored_key, map_ptr) catch return null;
+                        current_array_map = map_ptr;
+                    }
+                } else if (current_array_path != null and pathHasPrefix(header_path, current_array_path.?)) {
+                    // stay in current array context for subtables
+                    current_array_map = current_array_map;
+                } else {
+                    current_array_map = null;
+                }
+
+                // Ensure parent paths are not values
+                if (header_path.len > 1) {
+                    var pidx: usize = 0;
+                    while (pidx + 1 < header_path.len) : (pidx += 1) {
+                        const prefix = header_path[0 .. pidx + 1];
+                        const prefix_key = joinPathForMessage(allocator, prefix) catch return null;
+                        defer allocator.free(prefix_key);
+                        const map_ref = if (current_array_path != null and pathHasPrefix(prefix, current_array_path.?))
+                            current_array_map orelse &kinds
+                        else
+                            &kinds;
+                        if (map_ref.get(prefix_key)) |kind| {
+                            if (kind == .value) {
+                                const diag = keyConflictRangeDiagnostic(
+                                    allocator,
+                                    .{ .line = line_index, .start = 0, .end = line_text.len },
+                                    prefix,
+                                    "Table conflicts with non-table value",
+                                    severity,
+                                    allocated_messages,
+                                ) orelse return null;
+                                diags.append(allocator, diag) catch {};
+                            }
+                        } else {
+                            map_ref.put(allocator.dupe(u8, prefix_key) catch return null, .table) catch return null;
+                        }
+                }
+                }
+
+                const header_key = joinPathForMessage(allocator, header_path) catch return null;
+                defer allocator.free(header_key);
+                const header_kind = if (is_array) PathKind.array else PathKind.table;
+
+                const header_map = if (current_array_path != null and !is_array and pathHasPrefix(header_path, current_array_path.?))
+                    current_array_map orelse &kinds
+                else
+                    &kinds;
+
+                if (recordPathKind(
+                    allocator,
+                    header_map,
+                    header_key,
+                    header_kind,
+                    header_path,
+                    .{
+                        .line = line_index,
+                        .start = 0,
+                        .end = line_text.len,
+                    },
+                    severity,
+                    allocated_messages,
+                )) |conflict_diag| {
+                    diags.append(allocator, conflict_diag) catch {};
+                }
+
+                line_index += 1;
+                continue;
+            }
+        }
+
+        if (parseKeySegments(allocator, line_text)) |segments| {
+            defer allocator.free(segments);
+            if (segments.len == 0) {
+                line_index += 1;
+                continue;
+            }
+            const key_path = segmentsToPath(allocator, segments) orelse return null;
+            defer allocator.free(key_path);
+            const combined = joinPaths(allocator, current_path, key_path) orelse return null;
+            defer allocator.free(combined);
+
+            const in_array = current_array_path != null and pathHasPrefix(combined, current_array_path.?);
+            const map_ref = if (in_array) current_array_map orelse &kinds else &kinds;
+
+            // Ensure parents are tables (or arrays for current array context)
+            var idx: usize = 0;
+            while (idx + 1 < combined.len) : (idx += 1) {
+                const prefix = combined[0 .. idx + 1];
+                const prefix_key = joinPathForMessage(allocator, prefix) catch return null;
+                defer allocator.free(prefix_key);
+
+                if (map_ref.get(prefix_key)) |kind| {
+                    if (kind == .value) {
+                        const diag = keyConflictDiagnostic(
+                            allocator,
+                            line_index,
+                            segments[segments.len - 1],
+                            prefix,
+                            "Key conflicts with non-table value",
+                            severity,
+                            allocated_messages,
+                        ) orelse return null;
+                        diags.append(allocator, diag) catch {};
+                    }
+                } else {
+                    map_ref.put(allocator.dupe(u8, prefix_key) catch return null, .table) catch return null;
+                }
+            }
+
+            const last = segments[segments.len - 1];
+            const final_key = joinPathForMessage(allocator, combined) catch return null;
+            defer allocator.free(final_key);
+    if (map_ref.get(final_key)) |kind| {
+        const msg = switch (kind) {
+            .value => "Duplicate key",
+            .table => "Key conflicts with existing table",
+            .array => "Key conflicts with existing array-of-tables",
+        };
+        const diag = keyConflictDiagnostic(
+            allocator,
+            line_index,
+            last,
+            combined,
+                    msg,
+                    severity,
+                    allocated_messages,
+                ) orelse return null;
+                diags.append(allocator, diag) catch {};
+            } else {
+                map_ref.put(allocator.dupe(u8, final_key) catch return null, .value) catch return null;
+            }
+        }
+
+        line_index += 1;
+    }
+
+    return diags.toOwnedSlice(allocator) catch null;
+}
+
+const LineRange = struct {
+    line: usize,
+    start: usize,
+    end: usize,
+};
+
+fn recordPathKind(
+    allocator: std.mem.Allocator,
+    kinds: *std.StringHashMap(PathKind),
+    key: []const u8,
+    kind: PathKind,
+    path: []const []const u8,
+    range: LineRange,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    if (kinds.get(key)) |existing| {
+        if (kind == .array and existing == .array) {
+            return null;
+        }
+        const msg = switch (kind) {
+            .table => if (existing == .array) "Table conflicts with existing array-of-tables" else "Duplicate table definition",
+            .array => if (existing == .table) "Array-of-tables conflicts with existing table" else "Duplicate array-of-tables definition",
+            .value => "Duplicate key",
+        };
+        return keyConflictRangeDiagnostic(allocator, range, path, msg, severity, allocated_messages);
+    }
+    kinds.put(allocator.dupe(u8, key) catch return null, kind) catch return null;
+    return null;
+}
+
+fn keyConflictDiagnostic(
+    allocator: std.mem.Allocator,
+    line_index: usize,
+    seg: KeySegment,
+    path: []const []const u8,
+    msg: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    return keyConflictRangeDiagnostic(allocator, .{ .line = line_index, .start = seg.start, .end = seg.end }, path, msg, severity, allocated_messages);
+}
+
+fn keyConflictRangeDiagnostic(
+    allocator: std.mem.Allocator,
+    range: LineRange,
+    path: []const []const u8,
+    msg: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const path_string = joinPathForMessage(allocator, path) catch return null;
+    defer allocator.free(path_string);
+    const message = std.fmt.allocPrint(allocator, "{s}: {s}", .{ msg, path_string }) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+    return .{
+        .range = .{
+            .start = .{ .line = @intCast(range.line), .character = @intCast(range.start) },
+            .end = .{ .line = @intCast(range.line), .character = @intCast(range.end) },
+        },
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn collectInlineTableDiagnostics(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?[]types.Diagnostic {
+    var diags: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            line_index += 1;
+            continue;
+        }
+
+        const eq_index = std.mem.indexOfScalar(u8, line_text, '=') orelse {
+            line_index += 1;
+            continue;
+        };
+        var val_pos = eq_index + 1;
+        while (val_pos < line_text.len and (line_text[val_pos] == ' ' or line_text[val_pos] == '\t')) : (val_pos += 1) {}
+        if (val_pos >= line_text.len or line_text[val_pos] != '{') {
+            line_index += 1;
+            continue;
+        }
+
+        if (scanInlineTableIssues(allocator, text, line_index, val_pos, severity, allocated_messages)) |diag| {
+            diags.append(allocator, diag) catch {};
+        }
+
+        line_index += 1;
+    }
+
+    return diags.toOwnedSlice(allocator) catch null;
+}
+
+fn scanInlineTableIssues(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    line_index: usize,
+    start_col: usize,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    var state: jade.QuoteState = .none;
+    var brace_depth: usize = 0;
+    var last_non_ws: ?u8 = null;
+
+    var line_cursor = line_index;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_cursor) orelse break;
+        var idx: usize = if (line_cursor == line_index) start_col else 0;
+        while (idx < line_text.len) : (idx += 1) {
+            jade.updateQuoteState(line_text, &idx, &state);
+            if (state != .none) continue;
+
+            const c = line_text[idx];
+            if (c == '#') break;
+            if (c == '{') {
+                brace_depth += 1;
+                continue;
+            }
+            if (c == '}') {
+                if (brace_depth == 1) {
+                    if (last_non_ws != null and last_non_ws.? == ',') {
+                        return inlineTableDiagnostic(
+                            allocator,
+                            line_cursor,
+                            idx,
+                            "Inline table cannot have a trailing comma",
+                            severity,
+                            allocated_messages,
+                        );
+                    }
+                    return null;
+                }
+                if (brace_depth > 0) brace_depth -= 1;
+            }
+            if (brace_depth >= 1) {
+                if (c == ',' or (c != ' ' and c != '\t' and c != '\r')) {
+                    last_non_ws = c;
+                }
+            }
+        }
+
+        if (line_cursor != line_index) {
+            return inlineTableDiagnostic(
+                allocator,
+                line_cursor,
+                0,
+                "Inline table cannot span multiple lines",
+                severity,
+                allocated_messages,
+            );
+        }
+
+        line_cursor += 1;
+        if (line_cursor >= jade.lineInfo(text).lines) break;
+    }
+    return null;
+}
+
+fn inlineTableDiagnostic(
+    allocator: std.mem.Allocator,
+    line: usize,
+    col: usize,
+    msg: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const message = std.fmt.allocPrint(allocator, "{s}", .{msg}) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+    return .{
+        .range = .{
+            .start = .{ .line = @intCast(line), .character = @intCast(col) },
+            .end = .{ .line = @intCast(line), .character = @intCast(col + 1) },
+        },
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn collectArrayTableOrderingDiagnostics(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?[]types.Diagnostic {
+    var diags: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
+
+    const HeaderInfo = struct {
+        path: [][]const u8,
+        line: usize,
+        start: usize,
+        end: usize,
+        is_array: bool,
+    };
+
+    var headers: std.ArrayList(HeaderInfo) = .empty;
+    errdefer headers.deinit(allocator);
+    defer headers.deinit(allocator);
+
+    var array_headers = std.StringHashMap(usize).init(allocator);
+    defer {
+        var it = array_headers.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        array_headers.deinit();
+    }
+
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            line_index += 1;
+            continue;
+        }
+        if (trimmed[0] == '[') {
+            if (parseTableHeaderPath(allocator, trimmed)) |header_path| {
+                const is_array = trimmed.len >= 4 and trimmed[0] == '[' and trimmed[1] == '[' and trimmed[trimmed.len - 2] == ']';
+                headers.append(allocator, .{
+                    .path = header_path,
+                    .line = line_index,
+                    .start = 0,
+                    .end = line_text.len,
+                    .is_array = is_array,
+                }) catch return null;
+                if (is_array) {
+                    const key = joinPathForMessage(allocator, header_path) catch return null;
+                    if (!array_headers.contains(key)) {
+                        array_headers.put(allocator.dupe(u8, key) catch return null, line_index) catch return null;
+                    }
+                    allocator.free(key);
+                }
+            }
+        }
+        line_index += 1;
+    }
+
+    defer {
+        for (headers.items) |entry| allocator.free(entry.path);
+    }
+
+    for (headers.items) |hdr| {
+        if (hdr.is_array) continue;
+        if (hdr.path.len <= 1) continue;
+        var idx: usize = 0;
+        while (idx + 1 < hdr.path.len) : (idx += 1) {
+            const prefix = hdr.path[0 .. idx + 1];
+            const key = joinPathForMessage(allocator, prefix) catch return null;
+            defer allocator.free(key);
+            if (array_headers.get(key)) |array_line| {
+                if (array_line > hdr.line) {
+                    const diag = keyConflictRangeDiagnostic(
+                        allocator,
+                        .{ .line = hdr.line, .start = hdr.start, .end = hdr.end },
+                        hdr.path,
+                        "Array-of-tables must be defined before its child tables",
+                        severity,
+                        allocated_messages,
+                    ) orelse return null;
+                    diags.append(allocator, diag) catch {};
+                    break;
+                }
+            }
+        }
+    }
+
+    return diags.toOwnedSlice(allocator) catch null;
 }
 
 fn extractUriFromArgs(arguments: ?[]const std.json.Value) ?[]const u8 {
@@ -946,6 +1649,227 @@ fn tomlValueStringExpandedDepth(
     }
 }
 
+const ArrayScan = struct {
+    end_line: usize,
+    has_trailing: bool,
+};
+
+fn scanArrayTrailingComma(text: []const u8, start_line: usize, start_col: usize) ArrayScan {
+    var line_index = start_line;
+    var started = false;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    var state: jade.QuoteState = .none;
+    var last_non_ws: ?u8 = null;
+
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        var i: usize = if (line_index == start_line) start_col else 0;
+        while (i < line_text.len) : (i += 1) {
+            jade.updateQuoteState(line_text, &i, &state);
+            if (state != .none) continue;
+
+            const c = line_text[i];
+            if (!started) {
+                if (c == '[') {
+                    started = true;
+                    bracket_depth = 1;
+                }
+                continue;
+            }
+
+            if (c == '#') break;
+            if (c == '[') bracket_depth += 1;
+            if (c == ']') {
+                if (bracket_depth == 1 and brace_depth == 0) {
+                    return .{
+                        .end_line = line_index,
+                        .has_trailing = last_non_ws != null and last_non_ws.? == ',',
+                    };
+                }
+                if (bracket_depth > 0) bracket_depth -= 1;
+                continue;
+            }
+            if (c == '{') brace_depth += 1;
+            if (c == '}' and brace_depth > 0) brace_depth -= 1;
+
+            if (bracket_depth == 1 and brace_depth == 0) {
+                if (c == ',' or (c != ' ' and c != '\t' and c != '\r')) {
+                    last_non_ws = c;
+                }
+            }
+        }
+        line_index += 1;
+    }
+
+    return .{ .end_line = line_index, .has_trailing = false };
+}
+
+fn safeFormatTrailingCommaArrays(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    var line_index: usize = 0;
+    while (true) {
+        const line_text = jade.lineSlice(text, line_index) orelse break;
+        const line_start = index;
+        const line_len = line_text.len;
+        const trimmed = std.mem.trim(u8, line_text, " \t");
+
+        if (trimmed.len != 0 and trimmed[0] == '[') {
+            // table header line
+            try out.appendSlice(allocator, text[line_start .. line_start + line_len]);
+            try out.appendSlice(allocator, "\n");
+            index = line_start + line_len + 1;
+            line_index += 1;
+            continue;
+        }
+
+        const eq_index = std.mem.indexOfScalar(u8, line_text, '=') orelse {
+            try out.appendSlice(allocator, text[line_start .. line_start + line_len]);
+            try out.appendSlice(allocator, "\n");
+            index = line_start + line_len + 1;
+            line_index += 1;
+            continue;
+        };
+
+        var val_pos = eq_index + 1;
+        while (val_pos < line_text.len and (line_text[val_pos] == ' ' or line_text[val_pos] == '\t')) : (val_pos += 1) {}
+        if (val_pos >= line_text.len or line_text[val_pos] != '[') {
+            try out.appendSlice(allocator, text[line_start .. line_start + line_len]);
+            try out.appendSlice(allocator, "\n");
+            index = line_start + line_len + 1;
+            line_index += 1;
+            continue;
+        }
+
+        const scan = scanArrayTrailingComma(text, line_index, val_pos);
+        if (!scan.has_trailing) {
+            try out.appendSlice(allocator, text[line_start .. line_start + line_len]);
+            try out.appendSlice(allocator, "\n");
+            index = line_start + line_len + 1;
+            line_index += 1;
+            continue;
+        }
+
+        const start_index = line_start + val_pos;
+        const end_index = findMatchingArrayEnd(text, start_index);
+        const indent = leadingIndentCount(line_text);
+        const header = text[line_start..start_index];
+
+        try out.appendSlice(allocator, header);
+        try out.appendSlice(allocator, "[\n");
+
+        var items = try parseArrayItems(allocator, text[start_index + 1 .. end_index]);
+        defer {
+            for (items.items) |item| allocator.free(item);
+            items.deinit(allocator);
+        }
+
+        for (items.items) |item| {
+            try writeIndent(&out, allocator, indent + 4);
+            try out.appendSlice(allocator, item);
+            try out.appendSlice(allocator, ",\n");
+        }
+        try writeIndent(&out, allocator, indent);
+        try out.appendSlice(allocator, "]");
+
+        index = end_index + 1;
+        line_index = scan.end_line + 1;
+        if (index < text.len and text[index] == '\n') {
+            try out.appendSlice(allocator, "\n");
+            index += 1;
+        } else {
+            try out.appendSlice(allocator, "\n");
+        }
+    }
+
+    if (index < text.len) {
+        try out.appendSlice(allocator, text[index..]);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn leadingIndentCount(line_text: []const u8) usize {
+    var count: usize = 0;
+    while (count < line_text.len and (line_text[count] == ' ' or line_text[count] == '\t')) : (count += 1) {}
+    return count;
+}
+
+fn writeIndent(out: *std.ArrayList(u8), allocator: std.mem.Allocator, count: usize) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        try out.append(allocator, ' ');
+    }
+}
+
+fn findMatchingArrayEnd(text: []const u8, start_index: usize) usize {
+    var idx = start_index;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    var state: jade.QuoteState = .none;
+    while (idx < text.len) : (idx += 1) {
+        jade.updateQuoteState(text, &idx, &state);
+        if (state != .none) continue;
+        const c = text[idx];
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') {
+            if (bracket_depth == 1 and brace_depth == 0) return idx;
+            if (bracket_depth > 0) bracket_depth -= 1;
+        }
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+    }
+    return text.len - 1;
+}
+
+fn parseArrayItems(allocator: std.mem.Allocator, slice: []const u8) !std.ArrayList([]const u8) {
+    var items: std.ArrayList([]const u8) = .empty;
+    errdefer items.deinit(allocator);
+
+    var state: jade.QuoteState = .none;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    var start: usize = 0;
+    var idx: usize = 0;
+
+    while (idx < slice.len) : (idx += 1) {
+        jade.updateQuoteState(slice, &idx, &state);
+        if (state != .none) continue;
+
+        const c = slice[idx];
+        if (c == '#') {
+            while (idx < slice.len and slice[idx] != '\n') : (idx += 1) {}
+            continue;
+        }
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+        }
+        if (c == '{') brace_depth += 1;
+        if (c == '}' and brace_depth > 0) brace_depth -= 1;
+
+        if (c == ',' and bracket_depth == 0 and brace_depth == 0) {
+            const item = std.mem.trim(u8, slice[start..idx], " \t\r\n");
+            if (item.len != 0) {
+                const copy = try allocator.dupe(u8, item);
+                try items.append(allocator, copy);
+            }
+            start = idx + 1;
+        }
+    }
+
+    const tail = std.mem.trim(u8, slice[start..], " \t\r\n");
+    if (tail.len != 0) {
+        const copy = try allocator.dupe(u8, tail);
+        try items.append(allocator, copy);
+    }
+
+    return items;
+}
+
 fn templatePathHasCycle(
     allocator: std.mem.Allocator,
     path: []const []const u8,
@@ -991,6 +1915,284 @@ fn templatePathHasCycleRec(
         }
     }
     return false;
+}
+
+const LineBounds = struct {
+    line_index: usize,
+    line_start: usize,
+    line_end: usize,
+    column: usize,
+    line_text: []const u8,
+};
+
+fn lineBoundsForIndex(text: []const u8, index: usize) ?LineBounds {
+    const pos = positionFromIndex(text, index);
+    const line_text = jade.lineSlice(text, pos.line) orelse return null;
+    const line_start = positionToIndex(text, @intCast(pos.line), 0);
+    return .{
+        .line_index = pos.line,
+        .line_start = line_start,
+        .line_end = line_start + line_text.len,
+        .column = pos.character,
+        .line_text = line_text,
+    };
+}
+
+fn findAssignmentEqIndex(line_text: []const u8) ?usize {
+    var state: jade.QuoteState = .none;
+    var i: usize = 0;
+    while (i < line_text.len) : (i += 1) {
+        jade.updateQuoteState(line_text, &i, &state);
+        if (state == .none) {
+            if (line_text[i] == '#') return null;
+            if (line_text[i] == '=') return i;
+        }
+    }
+    return null;
+}
+
+fn assignmentKeyRangeForLine(line_text: []const u8) ?jade.Span {
+    const eq_index = findAssignmentEqIndex(line_text) orelse return null;
+    var left: usize = 0;
+    while (left < eq_index and (line_text[left] == ' ' or line_text[left] == '\t')) : (left += 1) {}
+    var right: usize = eq_index;
+    while (right > left and (line_text[right - 1] == ' ' or line_text[right - 1] == '\t')) : (right -= 1) {}
+    if (right <= left) return null;
+    return .{ .start = left, .end = right };
+}
+
+fn tableHeaderRangeForLine(line_text: []const u8) ?jade.Span {
+    var i: usize = 0;
+    while (i < line_text.len and (line_text[i] == ' ' or line_text[i] == '\t')) : (i += 1) {}
+    if (i >= line_text.len or line_text[i] != '[') return null;
+
+    var state: jade.QuoteState = .none;
+    var idx: usize = i;
+    while (idx < line_text.len) : (idx += 1) {
+        jade.updateQuoteState(line_text, &idx, &state);
+        if (state == .none and line_text[idx] == ']') {
+            return .{ .start = i, .end = idx + 1 };
+        }
+        if (state == .none and line_text[idx] == '#') {
+            return null;
+        }
+    }
+    return null;
+}
+
+fn inlineKeyRangesInLine(allocator: std.mem.Allocator, line_text: []const u8) ?[]jade.Span {
+    const eq_index = findAssignmentEqIndex(line_text) orelse return null;
+    var state: jade.QuoteState = .none;
+    var i: usize = eq_index + 1;
+    var brace_open: ?usize = null;
+    while (i < line_text.len) : (i += 1) {
+        jade.updateQuoteState(line_text, &i, &state);
+        if (state == .none and line_text[i] == '{') {
+            brace_open = i;
+            break;
+        }
+    }
+    const open = brace_open orelse return null;
+
+    state = .none;
+    var depth: usize = 0;
+    var close: ?usize = null;
+    i = open;
+    while (i < line_text.len) : (i += 1) {
+        jade.updateQuoteState(line_text, &i, &state);
+        if (state == .none) {
+            if (line_text[i] == '{') depth += 1;
+            if (line_text[i] == '}') {
+                if (depth == 0) break;
+                depth -= 1;
+                if (depth == 0) {
+                    close = i;
+                    break;
+                }
+            }
+        }
+    }
+    const end = close orelse return null;
+    if (end <= open + 1) return null;
+    const inside = line_text[open + 1 .. end];
+
+    var ranges: std.ArrayList(jade.Span) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    state = .none;
+    depth = 0;
+    var seg_start: usize = 0;
+    var idx: usize = 0;
+    while (idx <= inside.len) : (idx += 1) {
+        const at_end = idx == inside.len;
+        if (!at_end) {
+            jade.updateQuoteState(inside, &idx, &state);
+        }
+        const ch = if (at_end) ',' else inside[idx];
+        if (state == .none) {
+            if (!at_end) {
+                if (ch == '{') depth += 1;
+                if (ch == '}') {
+                    if (depth > 0) depth -= 1;
+                }
+            }
+            if (at_end or (ch == ',' and depth == 0)) {
+                const seg_raw = inside[seg_start..idx];
+                const seg = std.mem.trim(u8, seg_raw, " \t");
+                if (seg.len > 0) {
+                    var seg_state: jade.QuoteState = .none;
+                    var seg_idx: usize = 0;
+                    var seg_eq: ?usize = null;
+                    while (seg_idx < seg.len) : (seg_idx += 1) {
+                        jade.updateQuoteState(seg, &seg_idx, &seg_state);
+                        if (seg_state == .none and seg[seg_idx] == '=') {
+                            seg_eq = seg_idx;
+                            break;
+                        }
+                    }
+                    if (seg_eq) |eq_pos| {
+                        const key_raw = std.mem.trim(u8, seg[0..eq_pos], " \t");
+                        if (key_raw.len > 0) {
+                            var lead: usize = 0;
+                            while (lead < seg_raw.len and (seg_raw[lead] == ' ' or seg_raw[lead] == '\t')) : (lead += 1) {}
+                            const key_start = open + 1 + seg_start + lead;
+                            const key_end = key_start + key_raw.len;
+                            ranges.append(allocator, .{ .start = key_start, .end = key_end }) catch {};
+                        }
+                    }
+                }
+                seg_start = idx + 1;
+            }
+        }
+    }
+
+    if (ranges.items.len == 0) return null;
+    return ranges.toOwnedSlice(allocator) catch null;
+}
+
+fn templateSpanInTableHeader(text: []const u8, span: jade.TemplateSpan) bool {
+    const bounds = lineBoundsForIndex(text, span.start) orelse return false;
+    if (tableHeaderRangeForLine(bounds.line_text)) |range| {
+        return span.start >= bounds.line_start + range.start and span.end <= bounds.line_start + range.end;
+    }
+    return false;
+}
+
+fn templateSpanInAssignmentKey(text: []const u8, span: jade.TemplateSpan) bool {
+    const bounds = lineBoundsForIndex(text, span.start) orelse return false;
+    const range = assignmentKeyRangeForLine(bounds.line_text) orelse return false;
+    return span.start >= bounds.line_start + range.start and span.end <= bounds.line_start + range.end;
+}
+
+fn templateSpanInInlineTableKey(allocator: std.mem.Allocator, text: []const u8, span: jade.TemplateSpan) bool {
+    const bounds = lineBoundsForIndex(text, span.start) orelse return false;
+    const ranges = inlineKeyRangesInLine(allocator, bounds.line_text) orelse return false;
+    defer allocator.free(ranges);
+    for (ranges) |range| {
+        if (span.start >= bounds.line_start + range.start and span.end <= bounds.line_start + range.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn templateKeyDiagnostic(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    span: jade.TemplateSpan,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const range = rangeFromSpan(text, span.start, span.end);
+    const message = std.fmt.allocPrint(allocator, "Templates are not allowed in keys", .{}) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+    return .{
+        .range = range,
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn templateInlineKeyDiagnostic(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    span: jade.TemplateSpan,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const range = rangeFromSpan(text, span.start, span.end);
+    const message = std.fmt.allocPrint(allocator, "Templates are not allowed in inline table keys", .{}) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+    return .{
+        .range = range,
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn templateHeaderDiagnostic(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    span: jade.TemplateSpan,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const range = rangeFromSpan(text, span.start, span.end);
+    const message = std.fmt.allocPrint(allocator, "Templates are not allowed in table headers", .{}) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+    return .{
+        .range = range,
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn collectCommentControlCharDiagnostics(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?[]types.Diagnostic {
+    var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer diagnostics.deinit(allocator);
+
+    var state: jade.QuoteState = .none;
+    var comment_start: ?usize = null;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        if (ch == '\n') {
+            comment_start = null;
+            continue;
+        }
+
+        if (comment_start) |start| {
+            _ = start;
+            if ((ch < 0x20 and ch != '\t') or ch == 0x7F) {
+                const range = rangeFromSpan(text, i, i + 1);
+                const message = std.fmt.allocPrint(allocator, "Control characters are not allowed in comments", .{}) catch return null;
+                allocated_messages.append(allocator, message) catch return null;
+                diagnostics.append(allocator, .{
+                    .range = range,
+                    .severity = diagnosticSeverityToLsp(severity),
+                    .source = "jade",
+                    .message = message,
+                }) catch {};
+            }
+            continue;
+        }
+
+        jade.updateQuoteState(text, &i, &state);
+        if (state == .none and text[i] == '#') {
+            comment_start = i + 1;
+        }
+    }
+
+    if (diagnostics.items.len == 0) return null;
+    return diagnostics.toOwnedSlice(allocator) catch null;
 }
 
 fn tomlValueString(allocator: std.mem.Allocator, value: toml.Value) ?[]const u8 {
@@ -1050,6 +2252,16 @@ const TableHeaderInfo = struct {
     index: ?usize,
 };
 
+fn tableHeaderHasTemplate(line_text: []const u8) bool {
+    if (tableHeaderRangeForLine(line_text)) |range| {
+        if (range.end > range.start) {
+            const slice = line_text[range.start..range.end];
+            return std.mem.indexOf(u8, slice, "{{") != null;
+        }
+    }
+    return false;
+}
+
 fn tableHeaderInfo(allocator: std.mem.Allocator, text: []const u8, line: usize) ?TableHeaderInfo {
     const line_text = jade.lineSlice(text, line) orelse return null;
     const trimmed = std.mem.trim(u8, line_text, " \t");
@@ -1058,6 +2270,7 @@ fn tableHeaderInfo(allocator: std.mem.Allocator, text: []const u8, line: usize) 
     const is_array = trimmed.len >= 4 and trimmed[0] == '[' and trimmed[1] == '[';
     if (!is_array and trimmed[0] != '[') return null;
     if (is_array and trimmed[trimmed.len - 2] != ']') return null;
+    if (tableHeaderHasTemplate(line_text)) return null;
 
     const header_path = parseTableHeaderPath(allocator, trimmed) orelse return null;
     defer allocator.free(header_path);
@@ -1878,11 +3091,31 @@ fn applyJsonSettings(settings: *Settings, value: std.json.Value) void {
             if (diag.object.get("templateCycle")) |cycle| {
                 applyJsonRule(&settings.diagnostics.templates.cycle, cycle);
             }
+            if (diag.object.get("templateInKeys")) |in_keys| {
+                applyJsonRule(&settings.diagnostics.templates.in_keys, in_keys);
+            }
+            if (diag.object.get("templateInlineKeys")) |inline_keys| {
+                applyJsonRule(&settings.diagnostics.templates.inline_keys, inline_keys);
+            }
+            if (diag.object.get("templateInHeaders")) |in_headers| {
+                applyJsonRule(&settings.diagnostics.templates.in_headers, in_headers);
+            }
         }
     }
 
     if (obj.get("format")) |fmt| {
-        if (fmt == .bool) settings.format = fmt.bool;
+        switch (fmt) {
+            .bool => |b| settings.format.enabled = b,
+            .object => |fmt_obj| {
+                if (fmt_obj.get("enabled")) |enabled| {
+                    if (enabled == .bool) settings.format.enabled = enabled.bool;
+                }
+                if (fmt_obj.get("respect_trailing_commas")) |rtc| {
+                    if (rtc == .bool) settings.format.respect_trailing_commas = rtc.bool;
+                }
+            },
+            else => {},
+        }
     }
 }
 
@@ -1896,6 +3129,15 @@ fn applyJsonTemplateSettings(settings: *TemplateDiagnosticsSettings, value: std.
     }
     if (value.object.get("cycle")) |cycle| {
         applyJsonRule(&settings.cycle, cycle);
+    }
+    if (value.object.get("in_keys")) |in_keys| {
+        applyJsonRule(&settings.in_keys, in_keys);
+    }
+    if (value.object.get("inline_keys")) |inline_keys| {
+        applyJsonRule(&settings.inline_keys, inline_keys);
+    }
+    if (value.object.get("in_headers")) |in_headers| {
+        applyJsonRule(&settings.in_headers, in_headers);
     }
 }
 
@@ -1937,7 +3179,19 @@ fn applyTomlSettingsForUri(allocator: std.mem.Allocator, uri: []const u8, settin
 
 fn applyTomlSettings(settings: *Settings, table: toml.Table) void {
     if (table.get("format")) |fmt| {
-        if (fmt == .boolean) settings.format = fmt.boolean;
+        switch (fmt) {
+            .boolean => |b| settings.format.enabled = b,
+            .table => |t| {
+                const fmt_table = t.*;
+                if (fmt_table.get("enabled")) |enabled| {
+                    if (enabled == .boolean) settings.format.enabled = enabled.boolean;
+                }
+                if (fmt_table.get("respect_trailing_commas")) |rtc| {
+                    if (rtc == .boolean) settings.format.respect_trailing_commas = rtc.boolean;
+                }
+            },
+            else => {},
+        }
     }
     if (table.get("diagnostics")) |diag_value| {
         switch (diag_value) {
@@ -1970,6 +3224,15 @@ fn applyTomlTemplateSettings(settings: *TemplateDiagnosticsSettings, value: toml
             }
             if (tmpl_table.get("cycle")) |cycle| {
                 applyTomlRule(&settings.cycle, cycle);
+            }
+            if (tmpl_table.get("in_keys")) |in_keys| {
+                applyTomlRule(&settings.in_keys, in_keys);
+            }
+            if (tmpl_table.get("inline_keys")) |inline_keys| {
+                applyTomlRule(&settings.inline_keys, inline_keys);
+            }
+            if (tmpl_table.get("in_headers")) |in_headers| {
+                applyTomlRule(&settings.in_headers, in_headers);
             }
         },
         else => {},
@@ -2575,7 +3838,11 @@ fn tomlValueType(value: toml.Value) []const u8 {
     };
 }
 
-fn formatTomlText(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
+fn formatTomlText(allocator: std.mem.Allocator, text: []const u8, format_settings: FormatSettings) ?[]u8 {
+    if (format_settings.respect_trailing_commas) {
+        return safeFormatTrailingCommaArrays(allocator, text) catch null;
+    }
+
     const mask = jade.maskJinjaForFormat(allocator, text) catch return null;
     defer allocator.free(mask.masked);
     defer {
@@ -2626,10 +3893,30 @@ test "formatTomlText preserves template placeholders" {
     const allocator = gpa.allocator();
 
     const input = "a = \"{{ params.value }}\"\n";
-    const formatted = formatTomlText(allocator, input) orelse return error.TestFailed;
+    const formatted = formatTomlText(allocator, input, .{}) orelse return error.TestFailed;
     defer allocator.free(formatted);
 
     try std.testing.expect(std.mem.indexOf(u8, formatted, "{{ params.value }}") != null);
+}
+
+test "format respects trailing commas in arrays" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input =
+        \\[server]
+        \\ports = [8000, 8001,]
+        \\
+    ;
+    const formatted = formatTomlText(allocator, input, .{ .respect_trailing_commas = true }) orelse
+        return error.TestFailed;
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "ports = [\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "    8000,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "    8001,\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "]") != null);
 }
 
 test "extractKeyPathAt picks prefix based on cursor position" {
@@ -2964,6 +4251,106 @@ test "hover resolves template referencing same table values" {
     try std.testing.expect(std.mem.indexOf(u8, info.value, "alpha") != null);
 }
 
+test "hover survives template in header and key" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\["{{ params.section }}"]
+        \\value = "ok"
+        \\"{{ params.key }}" = "bad key"
+        \\[server]
+        \\host = "127.0.0.1"
+        \\
+    ;
+
+    const span_mask = jade.maskJinja(allocator, text) catch return error.TestFailed;
+    defer allocator.free(span_mask.masked);
+    defer allocator.free(span_mask.spans);
+
+    const masked = jade.maskJinjaForFormatLenient(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    var server: Server = undefined;
+    const line_text = jade.lineSlice(text, 4) orelse return error.TestFailed;
+    const pos = std.mem.indexOf(u8, line_text, "host") orelse return error.TestFailed;
+    const info = server.resolveHoverInfo(allocator, masked.masked, text, 4, pos, span_mask.spans, masked.placeholders) orelse
+        return error.TestFailed;
+    defer allocator.free(info.value);
+    defer allocator.free(info.key);
+    defer allocator.free(info.table);
+    try std.testing.expectEqualStrings("string", info.ty);
+}
+
+test "example file parses with hover mask" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = std.fs.cwd().readFileAlloc(allocator, "examples/jade_test.toml", 1024 * 1024) catch
+        return error.TestFailed;
+    defer allocator.free(text);
+
+    const masked = jade.maskJinjaForFormatLenient(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    var parser = toml.Parser(toml.Table).init(allocator);
+    defer parser.deinit();
+    const parsed = parser.parseString(masked.masked) catch return error.TestFailed;
+    defer parsed.deinit();
+}
+
+test "example file yields template spans" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = std.fs.cwd().readFileAlloc(allocator, "examples/jade_test.toml", 1024 * 1024) catch
+        return error.TestFailed;
+    defer allocator.free(text);
+
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+    try std.testing.expect(spans.len > 0);
+}
+
+test "example file detects template header span" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = std.fs.cwd().readFileAlloc(allocator, "examples/jade_test.toml", 1024 * 1024) catch
+        return error.TestFailed;
+    defer allocator.free(text);
+
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    var found = false;
+    for (spans) |span| {
+        if (templateSpanInTableHeader(text, span)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "diagnostic detects template cycles" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -3011,6 +4398,309 @@ test "diagnostic detects template cycles" {
     try std.testing.expect(found);
 }
 
+test "diagnostics ignore templates inside comments" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\# {{ params.missing }}
+        \\# another {{ params.other }}
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    try std.testing.expect(spanInLineComment(text, spans[0]));
+}
+
+test "comment detection ignores hash inside strings" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\value = "# not a comment"
+        \\# {{ params.missing }}
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+    try std.testing.expect(spanInLineComment(text, spans[0]));
+}
+
+test "comment detection handles multiline strings" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\value = """
+        \\# not a comment inside multiline
+        \\still in string
+        \\"""
+        \\# {{ params.missing }}
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+    try std.testing.expect(spanInLineComment(text, spans[0]));
+}
+
+test "comment detection handles full-line comments with leading whitespace" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\    # {{ params.missing }}
+        \\value = "ok"
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+    try std.testing.expect(spanInLineComment(text, spans[0]));
+}
+
+test "comment detection ignores quotes inside comment lines" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\# comment "{{ params.missing }}"
+        \\value = "ok"
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+    try std.testing.expect(spanInLineComment(text, spans[0]));
+}
+
+test "diagnostic detects template in keys" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\"{{ params.key }}" = "value"
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    try std.testing.expect(templateSpanInAssignmentKey(text, spans[0]));
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diag = templateKeyDiagnostic(allocator, text, spans[0], .err, &messages);
+    try std.testing.expect(diag != null);
+}
+
+test "diagnostic detects template in table headers" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\["{{ params.section }}"]
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    try std.testing.expect(templateSpanInTableHeader(text, spans[0]));
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diag = templateHeaderDiagnostic(allocator, text, spans[0], .err, &messages);
+    try std.testing.expect(diag != null);
+}
+
+test "diagnostic detects template in inline table keys" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\meta = { "{{ params.key }}" = 1 }
+        \\
+    ;
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    try std.testing.expect(templateSpanInInlineTableKey(allocator, text, spans[0]));
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diag = templateInlineKeyDiagnostic(allocator, text, spans[0], .err, &messages);
+    try std.testing.expect(diag != null);
+}
+
+test "diagnostic detects control chars in comments" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = "a = 1 #\x01\n";
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectCommentControlCharDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expect(diags.len >= 1);
+}
+
+test "diagnostic detects duplicate keys" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\name = "a"
+        \\name = "b"
+        \\
+    ;
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectKeyConflictDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expect(diags.len >= 1);
+}
+
+test "diagnostic detects table array conflicts" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\[fruit]
+        \\[[fruit]]
+        \\
+    ;
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectKeyConflictDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expect(diags.len >= 1);
+}
+
+test "array-of-tables allow duplicate keys per element" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\[[services]]
+        \\name = "web"
+        \\config = { timeout = 30 }
+        \\[[services]]
+        \\name = "worker"
+        \\config = { timeout = 60 }
+        \\
+    ;
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectKeyConflictDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expectEqual(@as(usize, 0), diags.len);
+}
+
+test "diagnostic detects inline table trailing comma" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\point = { x = 1, y = 2, }
+        \\
+    ;
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectInlineTableDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expect(diags.len >= 1);
+}
+
+test "diagnostic detects array-of-tables ordering" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\[fruit.physical]
+        \\color = "red"
+        \\[[fruit]]
+        \\name = "apple"
+        \\
+    ;
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    const diags = collectArrayTableOrderingDiagnostics(allocator, text, .err, &messages) orelse return error.TestFailed;
+    defer allocator.free(diags);
+    try std.testing.expect(diags.len >= 1);
+}
+
+test "parse error message mapping uses friendly text" {
+    try std.testing.expect(std.mem.indexOf(u8, parseErrorMessage(error.UnexpectedToken), "Unexpected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parseErrorMessage(error.InvalidCharacter), "Invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parseErrorMessage(error.InvalidMonth), "Invalid") != null);
+}
+
+test "parser errors surface invalid values" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = "a =\n";
+    var parser = toml.Parser(toml.Table).init(allocator);
+    defer parser.deinit();
+    const parsed = parser.parseString(text) catch return;
+    defer parsed.deinit();
+    try std.testing.expect(false);
+}
+
 test "formatting disabled returns null" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -3023,7 +4713,7 @@ test "formatting disabled returns null" {
         .allocator = allocator,
         .transport = undefined,
         .docs = &store,
-        .settings = .{ .format = false },
+        .settings = .{ .format = .{ .enabled = false } },
     };
 
     const text = "b = 2\na = 1\n";
@@ -3125,7 +4815,7 @@ fn formatTomlFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const text = try std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
     defer allocator.free(text);
 
-    const formatted = formatTomlText(allocator, text) orelse return error.FormatFailed;
+    const formatted = formatTomlText(allocator, text, .{}) orelse return error.FormatFailed;
     defer allocator.free(formatted);
 
     var file = try std.fs.cwd().createFile(path, .{ .truncate = true });

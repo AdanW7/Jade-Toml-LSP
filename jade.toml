@@ -1,4 +1,6 @@
-format = true
+[format]
+enabled = true
+respect_trailing_commas = true
 
 [diagnostics]
 enabled = true
@@ -15,3 +17,15 @@ severity = "error"
 [diagnostics.templates.cycle]
 enabled = true
 severity = "error"
+
+[diagnostics.templates.in_keys]
+enabled = true
+severity = "warning"
+
+[diagnostics.templates.inline_keys]
+enabled = true
+severity = "warning"
+
+[diagnostics.templates.in_headers]
+enabled = true
+severity = "warning"

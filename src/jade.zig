@@ -150,6 +150,63 @@ pub fn maskJinjaForFormat(allocator: std.mem.Allocator, input: []const u8) !Form
     };
 }
 
+pub fn maskJinjaForFormatLenient(allocator: std.mem.Allocator, input: []const u8) !FormatMaskResult {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var placeholders: std.ArrayList(Placeholder) = .empty;
+    errdefer placeholders.deinit(allocator);
+
+    var line_start: usize = 0;
+    var state: QuoteState = .none;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == '\n') {
+            line_start = i + 1;
+            try out.append(allocator, '\n');
+            continue;
+        }
+
+        updateQuoteState(input, &i, &state);
+
+        if (i + 1 < input.len and input[i] == '{' and input[i + 1] == '{') {
+            const start = i;
+            var j = i + 2;
+            while (j + 1 < input.len) : (j += 1) {
+                if (input[j] == '}' and input[j + 1] == '}') {
+                    const end = j + 2;
+
+                    if (state == .none) {
+                        const len = end - start;
+                        var k: usize = 0;
+                        while (k < len) : (k += 1) {
+                            try out.append(allocator, ' ');
+                        }
+                        i = end - 1;
+                        break;
+                    }
+
+                    const token = try std.fmt.allocPrint(allocator, "__JADE_{d}__", .{placeholders.items.len});
+                    const original = try allocator.dupe(u8, input[start..end]);
+                    try placeholders.append(allocator, .{ .token = token, .original = original });
+                    try out.appendSlice(allocator, token);
+
+                    i = end - 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        try out.append(allocator, input[i]);
+    }
+
+    return .{
+        .masked = try out.toOwnedSlice(allocator),
+        .placeholders = try placeholders.toOwnedSlice(allocator),
+    };
+}
+
 pub const QuoteState = enum {
     none,
     single,

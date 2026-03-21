@@ -16,7 +16,9 @@ Inspired by the structure of ZLS and superhtml, and built on lsp-kit.
 Create a `jade.toml` in your project root to configure the LSP:
 
 ```toml
-format = true
+[format]
+enabled = true
+respect_trailing_commas = false
 
 [diagnostics]
 enabled = true
@@ -33,6 +35,18 @@ severity = "warning"
 [diagnostics.templates.cycle]
 enabled = true
 severity = "warning"
+
+[diagnostics.templates.in_keys]
+enabled = true
+severity = "error"
+
+[diagnostics.templates.inline_keys]
+enabled = true
+severity = "error"
+
+[diagnostics.templates.in_headers]
+enabled = true
+severity = "error"
 ```
 
 The server searches upward from the file’s directory to find `jade.toml`.
@@ -75,7 +89,10 @@ vim.lsp.config("jade", {
   root_markers = { "jade.toml", ".git" },
   settings = {
     jade = {
-      format = true,
+      format = {
+        enabled = true,
+        respect_trailing_commas = false,
+      },
       diagnostics = {
         enabled = true,
         severity = "info",
@@ -83,12 +100,37 @@ vim.lsp.config("jade", {
           outside_quotes = { enabled = true, severity = "error" },
           missing_key = { enabled = true, severity = "warning" },
           cycle = { enabled = true, severity = "warning" },
+          in_keys = { enabled = true, severity = "error" },
+          inline_keys = { enabled = true, severity = "error" },
+          in_headers = { enabled = true, severity = "error" },
         },
         templateOutsideQuotes = "error",
         templateMissingKey = "warning",
         templateCycle = "warning",
+        templateInKeys = "error",
+        templateInlineKeys = "error",
+        templateInHeaders = "error",
       },
     },
   },
 })
 ```
+
+JSON settings mirror the TOML keys:
+
+- `format.enabled`
+- `format.respect_trailing_commas`
+- `diagnostics.enabled`
+- `diagnostics.severity`
+- `diagnostics.templates.outside_quotes`
+- `diagnostics.templates.missing_key`
+- `diagnostics.templates.cycle`
+- `diagnostics.templates.in_keys`
+- `diagnostics.templates.inline_keys`
+- `diagnostics.templates.in_headers`
+- `diagnostics.templateOutsideQuotes`
+- `diagnostics.templateMissingKey`
+- `diagnostics.templateCycle`
+- `diagnostics.templateInKeys`
+- `diagnostics.templateInlineKeys`
+- `diagnostics.templateInHeaders`
