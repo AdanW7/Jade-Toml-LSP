@@ -1,5 +1,7 @@
 # Jade TOML LSP
 
+Repository: https://github.com/AdanW7/Jade-Toml-LSP
+
 Jade TOML LSP brings language-server features for templated TOML
 
 ## What this extension provides
@@ -21,4 +23,3 @@ Settings map directly to Jade’s LSP settings and `jade.toml`:
 - `jade_toml_lsp.diagnostics.enabled`
 - `jade_toml_lsp.diagnostics.severity`
 - `jade_toml_lsp.diagnostics.templates.*`
-

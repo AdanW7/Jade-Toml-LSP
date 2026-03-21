@@ -6,7 +6,7 @@
   "publisher": "jade",
   "repository": {
     "type": "git",
-    "url": "https://github.com/adan/dotfiles"
+    "url": "https://github.com/AdanW7/Jade-Toml-LSP"
   },
   "license": "SEE LICENSE IN LICENSE.md",
   "icon": "images/icon.png",

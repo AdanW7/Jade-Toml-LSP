@@ -75,7 +75,7 @@ Then point `vim.lsp.config` to the built executable (adjust path if needed):
 
 ```lua
 vim.lsp.config("jade_toml_lsp", {
-  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/macos/aarch64/release/jade_toml_lsp" },
+  cmd = { "jade_toml_lsp" },
   filetypes = { "toml" },
   root_markers = { "jade.toml", ".git" },
 })
@@ -87,7 +87,7 @@ If you want to pass LSP settings instead of `jade.toml`, use:
 
 ```lua
 vim.lsp.config("jade_toml_lsp", {
-  cmd = { "/Users/adan/dotfiles/tools/jade/zig-out/bin/macos/aarch64/release/jade_toml_lsp" },
+  cmd = { "jade_toml_lsp" },
   filetypes = { "toml" },
   root_markers = { "jade.toml", ".git" },
   settings = {
