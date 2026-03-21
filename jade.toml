@@ -1,0 +1,33 @@
+[format]
+enabled = false
+respect_trailing_commas = false
+
+[diagnostics]
+enabled = false
+
+# [diagnostics.templates.outside_quotes]
+# enabled = true
+# severity = "error"
+#
+# [diagnostics.templates.missing_key]
+# enabled = true
+# severity = "error"
+#
+# [diagnostics.templates.cycle]
+# enabled = true
+# severity = "error"
+#
+# [diagnostics.templates.in_keys]
+# enabled = true
+# severity = "warning"
+#
+# [diagnostics.templates.inline_keys]
+# enabled = true
+# severity = "warning"
+#
+# [diagnostics.templates.in_headers]
+# enabled = true
+# severity = "warning"
+#
+[inlay_hints]
+enabled = true
