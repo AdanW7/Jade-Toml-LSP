@@ -14,13 +14,13 @@ flags = { enabled = true, limit = 3, note = "{{ params.title }}" }
 host = "127.0.0.1"
 ports = [8000, 8001, "{{ params.port }}"]
 aliases = ["{{ params.labels.0 }}", "edge"]
-meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners.0 }}" }
+meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners[0] }}" }
 
 [[services]]
 name = "web"
 config = { timeout = 30, retries = "{{ params.retries }}" }
 owner = "{{ params.owners.0 }}"
-tags = ["http", "primary", "{{ params.labels.1 }}"]
+tags = ["http", "primary", "{{ params.labels[1] }}"]
 limits = { min = "{{ params.limits.min }}", max = "{{ params.limits.max }}" }
 
 [[services]]

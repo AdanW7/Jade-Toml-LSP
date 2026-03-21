@@ -2126,13 +2126,41 @@ fn splitDottedPath(allocator: std.mem.Allocator, text: []const u8) ?[][]const u8
     var it = std.mem.splitScalar(u8, text, '.');
     while (it.next()) |part_raw| {
         var part = std.mem.trim(u8, part_raw, " \t");
+        if (part.len == 0) return null;
         if (part.len >= 2) {
             if ((part[0] == '"' and part[part.len - 1] == '"') or (part[0] == '\'' and part[part.len - 1] == '\'')) {
-                part = part[1 .. part.len - 1];
+                const unquoted = part[1 .. part.len - 1];
+                if (unquoted.len == 0) return null;
+                parts.append(allocator, unquoted) catch return null;
+                continue;
             }
         }
-        if (part.len == 0) return null;
-        parts.append(allocator, part) catch return null;
+
+        var i: usize = 0;
+        var saw_token = false;
+        while (i < part.len) {
+            if (part[i] == '[') {
+                var end_idx = i + 1;
+                while (end_idx < part.len and part[end_idx] != ']') : (end_idx += 1) {}
+                if (end_idx >= part.len) return null;
+                const inner = std.mem.trim(u8, part[i + 1 .. end_idx], " \t");
+                if (inner.len == 0) return null;
+                parts.append(allocator, inner) catch return null;
+                saw_token = true;
+                i = end_idx + 1;
+                continue;
+            }
+
+            const start = i;
+            while (i < part.len and part[i] != '[') : (i += 1) {}
+            const token = std.mem.trim(u8, part[start..i], " \t");
+            if (token.len != 0) {
+                parts.append(allocator, token) catch return null;
+                saw_token = true;
+            }
+        }
+
+        if (!saw_token) return null;
     }
     return parts.toOwnedSlice(allocator) catch null;
 }
@@ -2659,10 +2687,18 @@ test "lookupTomlValue resolves array index segments" {
     defer parser.deinit();
     const parsed = parser.parseString(text) catch return error.TestFailed;
     defer parsed.deinit();
-    const path = splitDottedPath(allocator, "params.labels.1") orelse return error.TestFailed;
-    defer allocator.free(path);
-    const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
-    try std.testing.expectEqualStrings("beta", value.string);
+    {
+        const path = splitDottedPath(allocator, "params.labels.1") orelse return error.TestFailed;
+        defer allocator.free(path);
+        const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
+        try std.testing.expectEqualStrings("beta", value.string);
+    }
+    {
+        const path = splitDottedPath(allocator, "params.labels[2]") orelse return error.TestFailed;
+        defer allocator.free(path);
+        const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
+        try std.testing.expectEqualStrings("gamma", value.string);
+    }
 }
 
 test "array-of-tables hover resolves correct item per header" {
