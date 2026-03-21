@@ -5,20 +5,20 @@ title = "{{ params.title }}"
 # ---- Basic strings and escapes ----
 basic = "Simple string"
 literal = 'C:\Users\nodejs\templates'
-# multiline_basic = """
-# Roses are red
-# Violets are blue"""
-# multiline_basic_trimmed = """\
-# The quick brown \
-# fox jumps over \
-# the lazy dog.\
-# """
-# multiline_literal = '''
-# The first newline is
-# trimmed in raw strings.
-#    All other whitespace
-#    is preserved.
-# '''
+multiline_basic = """
+Roses are red
+Violets are blue"""
+multiline_basic_trimmed = """\
+The quick brown \
+fox jumps over \
+the lazy dog.\
+"""
+multiline_literal = '''
+The first newline is
+trimmed in raw strings.
+   All other whitespace
+   is preserved.
+'''
 quoted_key_value = "value"
 "127.0.0.1" = "quoted key"
 'quoted "value"' = "quoted key with quotes"
@@ -48,8 +48,8 @@ float_simple = 3.1415
 float_exp = 5e+22
 float_exp_neg = -2E-2
 float_sep = 224_617.445_991_228
-# float_inf = inf # spec-valid, but zig-toml doesn't parse these yet
-# float_nan = nan
+float_inf = inf
+float_nan = nan
 bool_true = true
 bool_false = false
 
@@ -147,9 +147,9 @@ type = { name = "Nail" }
 
 # ---- Spec examples (commented out, parser limitations) ----
 # basic = "I'm a string. \"You can quote me\". Name\tJose\nLocation\tSF."
-# unicode_escape = "Jos\u00E9"
-# multiline_basic = """Roses are red"""
-# multiline_literal = '''raw'''
+unicode_escape = "Jos\u00E9"
+multiline_basic = """Roses are red"""
+multiline_literal = '''raw'''
 
 # ---- Invalid examples (commented out) ----
 # name = "Tom" name = "Pradyun" # invalid: multiple kv on line
@@ -157,10 +157,9 @@ type = { name = "Nail" }
 # invalid_float_1 = .7
 # invalid_float_2 = 7.
 # invalid_float_3 = 3.e+20
-# float_inf = inf
-# float_nan = nan
 # [fruit]
 # [[fruit]] # invalid: table vs array
+# invalid: append to static array
 # fruits = []
-# [[fruits]] # invalid: append to static array
+# [[fruits]]
 # point = { x = 1, y = 2, } # invalid: inline table trailing comma

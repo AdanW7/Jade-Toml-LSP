@@ -243,7 +243,17 @@ const Server = struct {
         defer arena.free(span_mask.masked);
         defer arena.free(span_mask.spans);
 
-        const format_mask = jade.maskJinjaForFormatLenient(arena, text) catch return null;
+        const ml_mask = maskMultilineStrings(arena, text) catch return null;
+        defer arena.free(ml_mask.masked);
+        defer {
+            for (ml_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(ml_mask.placeholders);
+        }
+
+        const format_mask = jade.maskJinjaForFormatLenient(arena, ml_mask.masked) catch return null;
         defer arena.free(format_mask.masked);
         defer {
             for (format_mask.placeholders) |ph| {
@@ -253,15 +263,33 @@ const Server = struct {
             arena.free(format_mask.placeholders);
         }
 
+        const float_mask = maskSpecialFloats(arena, format_mask.masked) catch return null;
+        defer arena.free(float_mask.masked);
+        defer {
+            for (float_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(float_mask.placeholders);
+        }
+
+        const unicode_masked = normalizeUnicodeEscapes(arena, float_mask.masked) catch return null;
+        defer arena.free(unicode_masked);
+
+        const combined_placeholders = mergePlaceholders(arena, format_mask.placeholders, float_mask.placeholders) catch return null;
+        const combined_placeholders2 = mergePlaceholders(arena, combined_placeholders, ml_mask.placeholders) catch return null;
+        defer arena.free(combined_placeholders);
+        defer arena.free(combined_placeholders2);
+
         const span = jade.errorSpan(line_text, character);
         const hover = handler.resolveHoverInfo(
             arena,
-            format_mask.masked,
+            unicode_masked,
             text,
             line,
             character,
             span_mask.spans,
-            format_mask.placeholders,
+            combined_placeholders2,
         ) orelse return null;
         const message = std.fmt.allocPrint(
             arena,
@@ -375,7 +403,17 @@ const Server = struct {
         defer handler.allocator.free(masked.masked);
         defer handler.allocator.free(masked.spans);
 
-        const masked_lenient = jade.maskJinjaForFormatLenient(handler.allocator, text) catch return;
+        const ml_mask = maskMultilineStrings(handler.allocator, text) catch return;
+        defer handler.allocator.free(ml_mask.masked);
+        defer {
+            for (ml_mask.placeholders) |ph| {
+                handler.allocator.free(ph.token);
+                handler.allocator.free(ph.original);
+            }
+            handler.allocator.free(ml_mask.placeholders);
+        }
+
+        const masked_lenient = jade.maskJinjaForFormatLenient(handler.allocator, ml_mask.masked) catch return;
         defer handler.allocator.free(masked_lenient.masked);
         defer {
             for (masked_lenient.placeholders) |ph| {
@@ -384,6 +422,24 @@ const Server = struct {
             }
             handler.allocator.free(masked_lenient.placeholders);
         }
+
+        const float_mask = maskSpecialFloats(handler.allocator, masked_lenient.masked) catch return;
+        defer handler.allocator.free(float_mask.masked);
+        defer {
+            for (float_mask.placeholders) |ph| {
+                handler.allocator.free(ph.token);
+                handler.allocator.free(ph.original);
+            }
+            handler.allocator.free(float_mask.placeholders);
+        }
+
+        const unicode_masked = normalizeUnicodeEscapes(handler.allocator, float_mask.masked) catch return;
+        defer handler.allocator.free(unicode_masked);
+
+        const combined_placeholders = mergePlaceholders(handler.allocator, masked_lenient.placeholders, float_mask.placeholders) catch return;
+        const combined_placeholders2 = mergePlaceholders(handler.allocator, combined_placeholders, ml_mask.placeholders) catch return;
+        defer handler.allocator.free(combined_placeholders);
+        defer handler.allocator.free(combined_placeholders2);
 
         const template_spans = jade.templateSpans(handler.allocator, text) catch return;
         defer handler.allocator.free(template_spans);
@@ -477,7 +533,7 @@ const Server = struct {
             var parser = toml.Parser(toml.Table).init(handler.allocator);
             defer parser.deinit();
 
-            const parsed = parser.parseString(masked_lenient.masked) catch |err| {
+            const parsed = parser.parseString(unicode_masked) catch |err| {
                 if (parser.error_info) |info| {
                     switch (info) {
                         .parse => |pos| {
@@ -527,7 +583,7 @@ const Server = struct {
             if (settings.diagnostics.templates.cycle.enabled) {
                 var cycle_parser = toml.Parser(toml.Table).init(handler.allocator);
                 defer cycle_parser.deinit();
-                const cycle_parsed = cycle_parser.parseString(masked_lenient.masked) catch {
+                const cycle_parsed = cycle_parser.parseString(unicode_masked) catch {
                     handler.publishDiagnostics(uri, diagnostics.items);
                     return;
                 };
@@ -541,7 +597,7 @@ const Server = struct {
                         text,
                         span,
                         cycle_parsed.value,
-                        masked_lenient.placeholders,
+                        combined_placeholders2,
                         settings.diagnostics.templates.cycle.severity,
                         &allocated_messages,
                     )) |diag| {
@@ -690,7 +746,7 @@ const Server = struct {
                     const key_name = formatArrayKeyName(arena, array_info.path, array_info.index) orelse "";
                     const table_name = tableNameWithArrayContext(arena, array_info.path, array_ctx) orelse "";
                     return .{
-                        .ty = tomlValueType(item),
+                        .ty = tomlValueTypeExpanded(item, placeholders),
                         .value = value_text,
                         .key = key_name,
                         .table = table_name,
@@ -718,7 +774,7 @@ const Server = struct {
             const key_name = pathToKeyName(arena, inline_info.path) orelse "";
             const table_name = tableNameWithArrayContext(arena, inline_info.path, array_ctx) orelse "";
             return .{
-                .ty = tomlValueType(value),
+                .ty = tomlValueTypeExpanded(value, placeholders),
                 .value = value_text,
                 .key = key_name,
                 .table = table_name,
@@ -740,7 +796,7 @@ const Server = struct {
                 if (lookupTomlValue(parsed.value, template_path)) |expanded| {
                     const expanded_text = tomlValueStringExpanded(arena, expanded, placeholders, parsed.value) catch return null;
                     return .{
-                        .ty = tomlValueType(value),
+                        .ty = tomlValueTypeExpanded(value, placeholders),
                         .value = expanded_text,
                         .key = key_name,
                         .table = table_name,
@@ -750,7 +806,7 @@ const Server = struct {
         }
 
         return .{
-            .ty = tomlValueType(value),
+            .ty = tomlValueTypeExpanded(value, placeholders),
             .value = value_text,
             .key = key_name,
             .table = table_name,
@@ -945,6 +1001,225 @@ fn pathHasPrefix(path: []const []const u8, prefix: []const []const u8) bool {
         if (!std.mem.eql(u8, part, path[idx])) return false;
     }
     return true;
+}
+
+const SpecialFloatMask = struct {
+    masked: []u8,
+    placeholders: []const jade.Placeholder,
+};
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-'
+        or c == '.';
+}
+
+fn normalizeUnicodeEscapes(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var state: jade.QuoteState = .none;
+    var in_comment = false;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (in_comment) {
+            try out.append(allocator, input[i]);
+            if (input[i] == '\n') in_comment = false;
+            continue;
+        }
+
+        jade.updateQuoteState(input, &i, &state);
+        if (state == .none and input[i] == '#') {
+            in_comment = true;
+            try out.append(allocator, input[i]);
+            continue;
+        }
+
+        if ((state == .double or state == .multi_double) and input[i] == '\\' and i + 1 < input.len) {
+            const esc = input[i + 1];
+            if (esc == 'u' or esc == 'U') {
+                const digits: usize = if (esc == 'u') 4 else 8;
+                if (i + 1 + digits < input.len) {
+                    var cp: u21 = 0;
+                    var ok = true;
+                    var j: usize = 0;
+                    while (j < digits) : (j += 1) {
+                        const d = input[i + 2 + j];
+                        const v = hexValue(d) orelse {
+                            ok = false;
+                            break;
+                        };
+                        cp = (cp << 4) | @as(u21, v);
+                    }
+                    if (ok and std.unicode.utf8ValidCodepoint(cp)) {
+                        var buf: [4]u8 = undefined;
+                        var len: usize = 0;
+                        if (std.unicode.utf8Encode(cp, &buf)) |n| {
+                            len = n;
+                        } else |_| {
+                            ok = false;
+                        }
+                        if (ok) {
+                            try out.appendSlice(allocator, buf[0..len]);
+                            i += 1 + digits;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        try out.append(allocator, input[i]);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn maskMultilineStrings(allocator: std.mem.Allocator, input: []const u8) !SpecialFloatMask {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var placeholders: std.ArrayList(jade.Placeholder) = .empty;
+    errdefer placeholders.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        if (i + 2 < input.len and c == '"' and input[i + 1] == '"' and input[i + 2] == '"') {
+            const start = i;
+            i += 3;
+            while (i + 2 < input.len) : (i += 1) {
+                if (input[i] == '"' and input[i + 1] == '"' and input[i + 2] == '"') {
+                    const end = i + 3;
+                    const token = try std.fmt.allocPrint(allocator, "__JADE_ML_{d}__", .{placeholders.items.len});
+                    const original = try allocator.dupe(u8, input[start..end]);
+                    try placeholders.append(allocator, .{ .token = token, .original = original });
+                    try out.append(allocator, '"');
+                    try out.appendSlice(allocator, token);
+                    try out.append(allocator, '"');
+                    i = end - 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (i + 2 < input.len and c == '\'' and input[i + 1] == '\'' and input[i + 2] == '\'') {
+            const start = i;
+            i += 3;
+            while (i + 2 < input.len) : (i += 1) {
+                if (input[i] == '\'' and input[i + 1] == '\'' and input[i + 2] == '\'') {
+                    const end = i + 3;
+                    const token = try std.fmt.allocPrint(allocator, "__JADE_ML_{d}__", .{placeholders.items.len});
+                    const original = try allocator.dupe(u8, input[start..end]);
+                    try placeholders.append(allocator, .{ .token = token, .original = original });
+                    try out.append(allocator, '"');
+                    try out.appendSlice(allocator, token);
+                    try out.append(allocator, '"');
+                    i = end - 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        try out.append(allocator, c);
+    }
+
+    return .{
+        .masked = try out.toOwnedSlice(allocator),
+        .placeholders = try placeholders.toOwnedSlice(allocator),
+    };
+}
+
+fn matchSpecialFloatToken(input: []const u8, index: usize) ?struct { len: usize, token: []const u8 } {
+    if (index >= input.len) return null;
+    var start = index;
+    if (input[start] == '+' or input[start] == '-') {
+        if (start + 1 >= input.len) return null;
+        start += 1;
+    }
+    const slice = input[start..];
+    if (std.mem.startsWith(u8, slice, "inf")) {
+        return .{ .len = (start - index) + 3, .token = input[index .. index + (start - index) + 3] };
+    }
+    if (std.mem.startsWith(u8, slice, "nan")) {
+        return .{ .len = (start - index) + 3, .token = input[index .. index + (start - index) + 3] };
+    }
+    return null;
+}
+
+fn isSpecialFloatLiteral(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var start: usize = 0;
+    if (text[0] == '+' or text[0] == '-') {
+        if (text.len == 1) return false;
+        start = 1;
+    }
+    const rest = text[start..];
+    return std.mem.eql(u8, rest, "inf") or std.mem.eql(u8, rest, "nan");
+}
+
+fn maskSpecialFloats(allocator: std.mem.Allocator, input: []const u8) !SpecialFloatMask {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var placeholders: std.ArrayList(jade.Placeholder) = .empty;
+    errdefer placeholders.deinit(allocator);
+
+    var state: jade.QuoteState = .none;
+    var in_comment = false;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (in_comment) {
+            try out.append(allocator, input[i]);
+            if (input[i] == '\n') in_comment = false;
+            continue;
+        }
+
+        jade.updateQuoteState(input, &i, &state);
+        if (state == .none and input[i] == '#') {
+            in_comment = true;
+            try out.append(allocator, input[i]);
+            continue;
+        }
+
+        if (state == .none) {
+            if (matchSpecialFloatToken(input, i)) |match| {
+                const prev_ok = if (i == 0) true else !isIdentChar(input[i - 1]);
+                const next_index = i + match.len;
+                const next_ok = if (next_index >= input.len) true else !isIdentChar(input[next_index]);
+                if (prev_ok and next_ok) {
+                    const token = try std.fmt.allocPrint(allocator, "__JADE_FLOAT_{d}__", .{placeholders.items.len});
+                    const original = try allocator.dupe(u8, match.token);
+                    try placeholders.append(allocator, .{ .token = token, .original = original });
+                    try out.append(allocator, '"');
+                    try out.appendSlice(allocator, token);
+                    try out.append(allocator, '"');
+                    i += match.len - 1;
+                    continue;
+                }
+            }
+        }
+
+        try out.append(allocator, input[i]);
+    }
+
+    return .{
+        .masked = try out.toOwnedSlice(allocator),
+        .placeholders = try placeholders.toOwnedSlice(allocator),
+    };
+}
+
+fn mergePlaceholders(
+    allocator: std.mem.Allocator,
+    left: []const jade.Placeholder,
+    right: []const jade.Placeholder,
+) ![]jade.Placeholder {
+    if (left.len == 0 and right.len == 0) return allocator.alloc(jade.Placeholder, 0);
+    var out = try allocator.alloc(jade.Placeholder, left.len + right.len);
+    if (left.len > 0) @memcpy(out[0..left.len], left);
+    if (right.len > 0) @memcpy(out[left.len..], right);
+    return out;
 }
 
 fn collectKeyConflictDiagnostics(
@@ -1596,6 +1871,7 @@ fn expandPlaceholderValueDepth(
                     return tomlValueStringExpandedDepth(allocator, expanded, placeholders, root, depth + 1) catch null;
                 }
             }
+            return allocator.dupe(u8, ph.original) catch null;
         }
     }
     return null;
@@ -3838,12 +4114,33 @@ fn tomlValueType(value: toml.Value) []const u8 {
     };
 }
 
+fn tomlValueTypeExpanded(value: toml.Value, placeholders: []const jade.Placeholder) []const u8 {
+    if (value == .string) {
+        for (placeholders) |ph| {
+            if (std.mem.eql(u8, ph.token, value.string) and isSpecialFloatLiteral(ph.original)) {
+                return "float";
+            }
+        }
+    }
+    return tomlValueType(value);
+}
+
 fn formatTomlText(allocator: std.mem.Allocator, text: []const u8, format_settings: FormatSettings) ?[]u8 {
     if (format_settings.respect_trailing_commas) {
         return safeFormatTrailingCommaArrays(allocator, text) catch null;
     }
 
-    const mask = jade.maskJinjaForFormat(allocator, text) catch return null;
+    const ml_mask = maskMultilineStrings(allocator, text) catch return null;
+    defer allocator.free(ml_mask.masked);
+    defer {
+        for (ml_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(ml_mask.placeholders);
+    }
+
+    const mask = jade.maskJinjaForFormat(allocator, ml_mask.masked) catch return null;
     defer allocator.free(mask.masked);
     defer {
         for (mask.placeholders) |ph| {
@@ -3853,10 +4150,28 @@ fn formatTomlText(allocator: std.mem.Allocator, text: []const u8, format_setting
         allocator.free(mask.placeholders);
     }
 
+    const float_mask = maskSpecialFloats(allocator, mask.masked) catch return null;
+    defer allocator.free(float_mask.masked);
+    defer {
+        for (float_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(float_mask.placeholders);
+    }
+
+    const unicode_masked = normalizeUnicodeEscapes(allocator, float_mask.masked) catch return null;
+    defer allocator.free(unicode_masked);
+
+    const combined_placeholders = mergePlaceholders(allocator, mask.placeholders, float_mask.placeholders) catch return null;
+    const combined_placeholders2 = mergePlaceholders(allocator, combined_placeholders, ml_mask.placeholders) catch return null;
+    defer allocator.free(combined_placeholders);
+    defer allocator.free(combined_placeholders2);
+
     var parser = toml.Parser(toml.Table).init(allocator);
     defer parser.deinit();
 
-    const parsed = parser.parseString(mask.masked) catch return null;
+    const parsed = parser.parseString(unicode_masked) catch return null;
     defer parsed.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -3870,7 +4185,21 @@ fn formatTomlText(allocator: std.mem.Allocator, text: []const u8, format_setting
     if (formatted == null) return null;
     var current = formatted.?;
 
-    for (mask.placeholders) |ph| {
+    for (combined_placeholders2) |ph| {
+        if (isSpecialFloatLiteral(ph.original)) {
+            const quoted = std.fmt.allocPrint(allocator, "\"{s}\"", .{ph.token}) catch {
+                allocator.free(current);
+                return null;
+            };
+            defer allocator.free(quoted);
+            const replaced_quoted = jade.replaceAll(allocator, current, quoted, ph.original) catch {
+                allocator.free(current);
+                return null;
+            };
+            allocator.free(current);
+            current = replaced_quoted;
+        }
+
         const needle = std.fmt.allocPrint(allocator, "{s}", .{ph.token}) catch {
             allocator.free(current);
             return null;
@@ -3897,6 +4226,97 @@ test "formatTomlText preserves template placeholders" {
     defer allocator.free(formatted);
 
     try std.testing.expect(std.mem.indexOf(u8, formatted, "{{ params.value }}") != null);
+}
+
+test "formatTomlText preserves special float literals" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input =
+        \\a = inf
+        \\b = -nan
+        \\
+    ;
+    const formatted = formatTomlText(allocator, input, .{}) orelse return error.TestFailed;
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "inf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "-nan") != null);
+}
+
+test "formatTomlText handles unicode escapes" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input = "name = \"Jos\\u00E9\"\n";
+    const formatted = formatTomlText(allocator, input, .{}) orelse return error.TestFailed;
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "name") != null);
+}
+
+test "formatTomlText preserves multiline strings" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input =
+        \\multiline_basic = """
+        \\Roses are red
+        \\Violets are blue"""
+        \\
+    ;
+    const formatted = formatTomlText(allocator, input, .{}) orelse return error.TestFailed;
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "multiline_basic") != null);
+}
+
+test "maskMultilineStrings removes delimiters" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input =
+        \\multiline_basic = """
+        \\Roses are red
+        \\Violets are blue"""
+        \\
+    ;
+    const masked = try maskMultilineStrings(allocator, input);
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, masked.masked, "\"\"\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, masked.masked, "'''") == null);
+}
+
+test "tomlValueStringExpanded restores special float placeholders" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var root = toml.Table.init(allocator);
+    defer root.deinit();
+
+    const token = "__JADE_FLOAT_0__";
+    const placeholder = jade.Placeholder{
+        .token = token,
+        .original = "inf",
+    };
+    const value = toml.Value{ .string = token };
+    const rendered = tomlValueStringExpanded(allocator, value, &.{placeholder}, root) catch return error.TestFailed;
+    defer allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("inf", rendered);
 }
 
 test "format respects trailing commas in arrays" {
@@ -4299,7 +4719,17 @@ test "example file parses with hover mask" {
         return error.TestFailed;
     defer allocator.free(text);
 
-    const masked = jade.maskJinjaForFormatLenient(allocator, text) catch return error.TestFailed;
+    const ml_mask = maskMultilineStrings(allocator, text) catch return error.TestFailed;
+    defer allocator.free(ml_mask.masked);
+    defer {
+        for (ml_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(ml_mask.placeholders);
+    }
+
+    const masked = jade.maskJinjaForFormatLenient(allocator, ml_mask.masked) catch return error.TestFailed;
     defer allocator.free(masked.masked);
     defer {
         for (masked.placeholders) |ph| {
@@ -4309,9 +4739,22 @@ test "example file parses with hover mask" {
         allocator.free(masked.placeholders);
     }
 
+    const float_mask = maskSpecialFloats(allocator, masked.masked) catch return error.TestFailed;
+    defer allocator.free(float_mask.masked);
+    defer {
+        for (float_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(float_mask.placeholders);
+    }
+
+    const unicode_masked = normalizeUnicodeEscapes(allocator, float_mask.masked) catch return error.TestFailed;
+    defer allocator.free(unicode_masked);
+
     var parser = toml.Parser(toml.Table).init(allocator);
     defer parser.deinit();
-    const parsed = parser.parseString(masked.masked) catch return error.TestFailed;
+    const parsed = parser.parseString(unicode_masked) catch return error.TestFailed;
     defer parsed.deinit();
 }
 
