@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -7,15 +8,45 @@ const std = @import("std");
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
 pub fn build(b: *std.Build) void {
-    // Standard target options allow the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    const mode = b.option([]const u8, "mode", "Build mode: debug|release|safe|small (defaults to -Doptimize)") orelse "default";
+    const platform = b.option([]const u8, "platform", "Target platform: native|windows|linux|macos") orelse "native";
+    const arch_opt = b.option([]const u8, "arch", "Target arch: x86_64|aarch64 (defaults to host)");
+
+    const optimize: std.builtin.OptimizeMode = if (std.mem.eql(u8, mode, "default"))
+        b.standardOptimizeOption(.{})
+    else if (std.mem.eql(u8, mode, "debug"))
+        .Debug
+    else if (std.mem.eql(u8, mode, "release"))
+        .ReleaseFast
+    else if (std.mem.eql(u8, mode, "safe"))
+        .ReleaseSafe
+    else if (std.mem.eql(u8, mode, "small"))
+        .ReleaseSmall
+    else {
+        std.debug.print("Unknown -Dmode='{s}'. Expected debug|release|safe|small.\n", .{mode});
+        std.process.exit(1);
+    };
+
+    const target = if (std.mem.eql(u8, platform, "native"))
+        b.standardTargetOptions(.{})
+    else blk: {
+        var query: std.Target.Query = .{};
+        const arch = if (arch_opt) |arch_name|
+            parseArch(arch_name) orelse {
+                std.debug.print("Unknown -Darch='{s}'. Expected x86_64|aarch64.\n", .{arch_name});
+                std.process.exit(1);
+            }
+        else
+            builtin.cpu.arch;
+
+        query.cpu_arch = arch;
+        query.os_tag = parseOsTag(platform) orelse {
+            std.debug.print("Unknown -Dplatform='{s}'. Expected native|windows|linux|macos.\n", .{platform});
+            std.process.exit(1);
+        };
+        query.abi = builtin.abi;
+        break :blk b.resolveTargetQuery(query);
+    };
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -158,4 +189,17 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn parseArch(name: []const u8) ?std.Target.Cpu.Arch {
+    if (std.mem.eql(u8, name, "x86_64")) return .x86_64;
+    if (std.mem.eql(u8, name, "aarch64")) return .aarch64;
+    return null;
+}
+
+fn parseOsTag(name: []const u8) ?std.Target.Os.Tag {
+    if (std.mem.eql(u8, name, "windows")) return .windows;
+    if (std.mem.eql(u8, name, "linux")) return .linux;
+    if (std.mem.eql(u8, name, "macos")) return .macos;
+    return null;
 }

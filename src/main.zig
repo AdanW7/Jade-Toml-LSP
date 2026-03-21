@@ -70,6 +70,9 @@ const Server = struct {
                 .executeCommandProvider = .{
                     .commands = &.{FormatCommand},
                 },
+                .completionProvider = .{
+                    .triggerCharacters = &.{ "{", ".", " " },
+                },
                 .hoverProvider = .{ .bool = true },
                 .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
@@ -309,6 +312,73 @@ const Server = struct {
                 .end = .{ .line = @intCast(line), .character = @intCast(span.end) },
             },
         };
+    }
+
+    pub fn @"textDocument/completion"(
+        handler: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/completion"),
+    ) lsp.ResultType("textDocument/completion") {
+        const uri = params.textDocument.uri;
+        if (!isTomlUri(uri)) return null;
+
+        const text = handler.docs.get(uri) orelse return null;
+        const line = params.position.line;
+        const character = params.position.character;
+
+        const spans = jade.templateSpans(arena, text) catch return null;
+        defer arena.free(spans);
+
+        const ctx = templateCompletionContext(arena, text, spans, line, character) orelse return null;
+        defer arena.free(ctx.base_path);
+
+        const ml_mask = maskMultilineStrings(arena, text) catch return null;
+        defer arena.free(ml_mask.masked);
+        defer {
+            for (ml_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(ml_mask.placeholders);
+        }
+
+        const masked_lenient = jade.maskJinjaForFormatLenient(arena, ml_mask.masked) catch return null;
+        defer arena.free(masked_lenient.masked);
+        defer {
+            for (masked_lenient.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(masked_lenient.placeholders);
+        }
+
+        const float_mask = maskSpecialFloats(arena, masked_lenient.masked) catch return null;
+        defer arena.free(float_mask.masked);
+        defer {
+            for (float_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(float_mask.placeholders);
+        }
+
+        const unicode_masked = normalizeUnicodeEscapes(arena, float_mask.masked) catch return null;
+        defer arena.free(unicode_masked);
+
+        var parser = toml.Parser(toml.Table).init(arena);
+        defer parser.deinit();
+        const parsed = parser.parseString(unicode_masked) catch return null;
+        defer parsed.deinit();
+
+        const table = completionTableForPath(parsed.value, ctx.base_path) orelse return null;
+        const items = buildCompletionItems(arena, table, ctx.prefix) orelse return null;
+
+        const list: types.CompletionList = .{
+            .isIncomplete = false,
+            .items = items,
+        };
+
+        return .{ .CompletionList = list };
     }
 
     pub fn @"textDocument/definition"(
@@ -1929,6 +1999,115 @@ fn envFlagEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
     const value = std.process.getEnvVarOwned(allocator, name) catch return false;
     defer allocator.free(value);
     return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
+}
+
+const CompletionContext = struct {
+    base_path: [][]const u8,
+    prefix: []const u8,
+};
+
+fn templateCompletionContext(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    spans: []const jade.TemplateSpan,
+    line: u32,
+    character: u32,
+) ?CompletionContext {
+    const span = inTemplateAtFromSpans(spans, text, line, character) orelse return null;
+    if (!span.in_quotes) return null;
+
+    const cursor = positionToIndex(text, line, character);
+    const inner_start = span.start + 2;
+    const inner_end = span.end - 2;
+    if (cursor < inner_start) return null;
+    const bounded = if (cursor > inner_end) inner_end else cursor;
+    var inner = text[inner_start..bounded];
+
+    // Trim leading spaces.
+    inner = std.mem.trimLeft(u8, inner, " \t\r\n");
+    if (inner.len == 0) {
+        return .{ .base_path = allocator.alloc([]const u8, 0) catch return null, .prefix = "" };
+    }
+
+    // Stop at first pipe to ignore filters.
+    if (std.mem.indexOfScalar(u8, inner, '|')) |pipe_idx| {
+        inner = inner[0..pipe_idx];
+    }
+
+    // Trim trailing spaces.
+    inner = std.mem.trimRight(u8, inner, " \t\r\n");
+    if (inner.len == 0) {
+        return .{ .base_path = allocator.alloc([]const u8, 0) catch return null, .prefix = "" };
+    }
+
+    // Use last token after delimiter.
+    var end = inner.len;
+    while (end > 0 and (inner[end - 1] == ' ' or inner[end - 1] == '\t')) : (end -= 1) {}
+    var start = end;
+    while (start > 0) {
+        const c = inner[start - 1];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '|' or c == ')' or c == '}' or c == ',') break;
+        start -= 1;
+    }
+    const token = inner[start..end];
+
+    if (token.len == 0) {
+        return .{ .base_path = allocator.alloc([]const u8, 0) catch return null, .prefix = "" };
+    }
+
+    if (std.mem.lastIndexOfScalar(u8, token, '.')) |dot_idx| {
+        const base = token[0..dot_idx];
+        const prefix = token[dot_idx + 1 ..];
+        if (base.len == 0) {
+            return .{ .base_path = allocator.alloc([]const u8, 0) catch return null, .prefix = prefix };
+        }
+        const base_path = splitDottedPath(allocator, base) orelse return null;
+        return .{ .base_path = base_path, .prefix = prefix };
+    }
+
+    return .{ .base_path = allocator.alloc([]const u8, 0) catch return null, .prefix = token };
+}
+
+fn completionTableForPath(root: toml.Table, path: []const []const u8) ?toml.Table {
+    if (path.len == 0) return root;
+    const value = lookupTomlValue(root, path) orelse return null;
+    return switch (value) {
+        .table => |t| t.*,
+        .array => |ar| tableFromArray(ar) orelse return null,
+        else => null,
+    };
+}
+
+fn completionItemKindForValue(value: toml.Value) types.CompletionItemKind {
+    return switch (value) {
+        .table => .Module,
+        .array => .Field,
+        else => .Value,
+    };
+}
+
+fn buildCompletionItems(
+    allocator: std.mem.Allocator,
+    table: toml.Table,
+    prefix: []const u8,
+) ?[]types.CompletionItem {
+    var items: std.ArrayList(types.CompletionItem) = .empty;
+    errdefer items.deinit(allocator);
+
+    var it = table.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (prefix.len > 0 and !std.mem.startsWith(u8, key, prefix)) continue;
+        const value = entry.value_ptr.*;
+        items.append(allocator, .{
+            .label = key,
+            .kind = completionItemKindForValue(value),
+            .detail = tomlValueType(value),
+            .insertText = key,
+        }) catch return null;
+    }
+
+    return items.toOwnedSlice(allocator) catch null;
 }
 
 const ArrayScan = struct {
