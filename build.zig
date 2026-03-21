@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const mode = b.option([]const u8, "mode", "Build mode: debug|release|safe|small (defaults to -Doptimize)") orelse "default";
     const platform = b.option([]const u8, "platform", "Target platform: native|windows|linux|macos") orelse "native";
     const arch_opt = b.option([]const u8, "arch", "Target arch: x86_64|aarch64 (defaults to host)");
+    const release_matrix = b.option(bool, "release_matrix", "Build ReleaseFast binaries for windows/macos/linux (x86_64 + aarch64)") orelse false;
 
     const optimize: std.builtin.OptimizeMode = if (std.mem.eql(u8, mode, "default"))
         b.standardOptimizeOption(.{})
@@ -119,11 +120,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // This declares intent for the executable to be installed into the
-    // install prefix when running `zig build` (i.e. when executing the default
-    // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
+    const exe_sub_path = b.fmt("{s}/{s}/{s}/{s}", .{
+        osTagName(exe.rootModuleTarget().os.tag),
+        archName(exe.rootModuleTarget().cpu.arch),
+        optimizeName(optimize),
+        exe.out_filename,
+    });
+    b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .bin },
+        .dest_sub_path = exe_sub_path,
+    }).step);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
@@ -189,6 +195,14 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+    const matrix_step = addReleaseMatrix(b, mod, lsp_module, toml_module);
+    const release_all = b.step("release-matrix", "Build ReleaseFast binaries for windows/macos/linux (x86_64 + aarch64)");
+    release_all.dependOn(matrix_step);
+    const release_alias = b.step("release-all", "Alias for release-matrix");
+    release_alias.dependOn(matrix_step);
+    if (release_matrix) {
+        b.getInstallStep().dependOn(matrix_step);
+    }
 }
 
 fn parseArch(name: []const u8) ?std.Target.Cpu.Arch {
@@ -202,4 +216,85 @@ fn parseOsTag(name: []const u8) ?std.Target.Os.Tag {
     if (std.mem.eql(u8, name, "linux")) return .linux;
     if (std.mem.eql(u8, name, "macos")) return .macos;
     return null;
+}
+
+fn osTagName(tag: std.Target.Os.Tag) []const u8 {
+    return switch (tag) {
+        .windows => "windows",
+        .linux => "linux",
+        .macos => "macos",
+        else => "unknown",
+    };
+}
+
+fn archName(arch: std.Target.Cpu.Arch) []const u8 {
+    return switch (arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => "unknown",
+    };
+}
+
+fn optimizeName(optimize: std.builtin.OptimizeMode) []const u8 {
+    return switch (optimize) {
+        .Debug => "debug",
+        .ReleaseFast => "release",
+        .ReleaseSafe => "safe",
+        .ReleaseSmall => "small",
+    };
+}
+
+fn addReleaseMatrix(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    lsp_module: *std.Build.Module,
+    toml_module: *std.Build.Module,
+) *std.Build.Step {
+    const matrix_step = b.step("release-matrix-internal", "internal");
+
+    const targets = [_]struct { os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch }{
+        .{ .os = .windows, .arch = .x86_64 },
+        .{ .os = .windows, .arch = .aarch64 },
+        .{ .os = .linux, .arch = .x86_64 },
+        .{ .os = .linux, .arch = .aarch64 },
+        .{ .os = .macos, .arch = .x86_64 },
+        .{ .os = .macos, .arch = .aarch64 },
+    };
+
+    for (targets) |t| {
+        const query: std.Target.Query = .{
+            .cpu_arch = t.arch,
+            .os_tag = t.os,
+            .abi = builtin.abi,
+        };
+        const target = b.resolveTargetQuery(query);
+        const exe = b.addExecutable(.{
+            .name = "jade",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "jade", .module = mod },
+                    .{ .name = "lsp", .module = lsp_module },
+                    .{ .name = "toml", .module = toml_module },
+                },
+            }),
+        });
+
+        const sub_path = b.fmt("{s}/{s}/{s}/{s}", .{
+            osTagName(t.os),
+            archName(t.arch),
+            optimizeName(.ReleaseFast),
+            exe.out_filename,
+        });
+
+        const install = b.addInstallArtifact(exe, .{
+            .dest_dir = .{ .override = .bin },
+            .dest_sub_path = sub_path,
+        });
+        matrix_step.dependOn(&install.step);
+    }
+
+    return matrix_step;
 }

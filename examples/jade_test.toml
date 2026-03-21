@@ -24,6 +24,7 @@ quoted_key_value = "value"
 'quoted "value"' = "quoted key with quotes"
 # "" = "blank key" # allowed by spec but rejected by some parsers
 [params]
+key = "not good"
 title = "Example"
 port = 9000
 retries = 2
