@@ -454,7 +454,7 @@ const Server = struct {
             allocated_messages.deinit(handler.allocator);
         }
 
-        if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+        if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
             std.debug.print("jade diagnostics: spans={d} uri={s}\n", .{ template_spans.len, uri });
             if (jade.lineSlice(text, 0)) |lt| {
                 const span = jade.errorSpan(lt, 0);
@@ -655,14 +655,14 @@ const Server = struct {
             }
         }
 
-        if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+        if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
             std.debug.print("jade diagnostics: count={d} uri={s}\n", .{ diagnostics.items.len, uri });
         }
 
         handler.publishDiagnostics(uri, diagnostics.items);
     }
 
-    fn publishDiagnostics(handler: *Server, uri: []const u8, diagnostics: []const types.Diagnostic) void {
+fn publishDiagnostics(handler: *Server, uri: []const u8, diagnostics: []const types.Diagnostic) void {
         const payload: types.PublishDiagnosticsParams = .{
             .uri = uri,
             .diagnostics = diagnostics,
@@ -675,7 +675,7 @@ const Server = struct {
             payload,
             .{ .emit_null_optional_fields = false },
         ) catch |err| {
-            if (std.posix.getenv("JADE_DEBUG_DIAGNOSTICS") != null) {
+            if (envFlagEnabled(handler.allocator, "JADE_DEBUG_DIAGNOSTICS")) {
                 std.debug.print("jade publish diagnostics error: {s}\n", .{@errorName(err)});
             }
         };
@@ -1923,6 +1923,12 @@ fn tomlValueStringExpandedDepth(
             return tomlValueString(allocator, value) orelse return error.OutOfMemory;
         },
     }
+}
+
+fn envFlagEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    defer allocator.free(value);
+    return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
 }
 
 const ArrayScan = struct {
@@ -4756,6 +4762,29 @@ test "example file parses with hover mask" {
     defer parser.deinit();
     const parsed = parser.parseString(unicode_masked) catch return error.TestFailed;
     defer parsed.deinit();
+}
+
+test "example file masks multiline strings" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text = std.fs.cwd().readFileAlloc(allocator, "examples/jade_test.toml", 1024 * 1024) catch
+        return error.TestFailed;
+    defer allocator.free(text);
+
+    const ml_mask = try maskMultilineStrings(allocator, text);
+    defer allocator.free(ml_mask.masked);
+    defer {
+        for (ml_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(ml_mask.placeholders);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, ml_mask.masked, "\"\"\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ml_mask.masked, "'''") == null);
 }
 
 test "example file yields template spans" {
