@@ -3,7 +3,7 @@
   "displayName": "Jade TOML LSP",
   "description": "Language Server support for templated TOML with Jade.",
   "version": "0.0.1",
-  "publisher": "jade",
+  "publisher": "AdanW7",
   "repository": {
     "type": "git",
     "url": "https://github.com/AdanW7/Jade-Toml-LSP"
