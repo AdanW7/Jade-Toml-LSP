@@ -2,17 +2,23 @@
 
 Zig 0.15.2 LSP scaffold using lsp-kit (0.15.x branch) for templated TOML.
 
+Repository: https://github.com/AdanW7/Jade-Toml-LSP
+Marketplace: https://marketplace.visualstudio.com/items?itemName=AdanW7.jade-toml-lsp
+
 ## Goals
+
 - Handle plain `.toml` files.
 - Tolerate Jinja-style `{{ ... }}` blocks by masking them before parse.
 - Provide diagnostics and (eventually) completions inside template blocks.
 
 ## Status
+
 Minimal LSP loop (initialize + didOpen/didChange), document store, Jinja masking, TOML parsing diagnostics (via zig-toml), safe TOML formatting with template re-injection, and hover types from the parsed TOML AST.
 
 Inspired by the structure of ZLS and superhtml, and built on lsp-kit.
 
 ## Config (jade.toml)
+
 Create a `jade.toml` in your project root to configure the LSP:
 
 ```toml
@@ -55,16 +61,19 @@ enabled = false
 The server searches upward from the file’s directory to find `jade.toml`.
 
 ## Build
+
 ```bash
 zig build
 ```
 
 ## Run (stdio)
+
 ```bash
 zig build run
 ```
 
 ## Neovim (local testing)
+
 Build the binary once:
 
 ```bash
