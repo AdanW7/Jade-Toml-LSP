@@ -23,6 +23,7 @@ const DiagnosticsSettings = struct {
 const TemplateDiagnosticsSettings = struct {
     outside_quotes: DiagnosticsRule = .{ .severity = .err },
     missing_key: DiagnosticsRule = .{ .severity = .warn },
+    cycle: DiagnosticsRule = .{ .severity = .warn },
 };
 
 const DiagnosticsRule = struct {
@@ -32,6 +33,7 @@ const DiagnosticsRule = struct {
 
 const Settings = struct {
     diagnostics: DiagnosticsSettings = .{},
+    format: bool = true,
 };
 
 const Server = struct {
@@ -114,6 +116,9 @@ const Server = struct {
     ) lsp.ResultType("textDocument/formatting") {
         const uri = params.textDocument.uri;
         if (!isTomlUri(uri)) return null;
+        var settings = handler.settings;
+        applyTomlSettingsForUri(handler.allocator, uri, &settings);
+        if (!settings.format) return null;
 
         const text = handler.docs.get(uri) orelse return null;
         const formatted = handler.formatToml(arena, text) orelse return null;
@@ -133,6 +138,9 @@ const Server = struct {
     ) lsp.ResultType("textDocument/codeAction") {
         const uri = params.textDocument.uri;
         if (!isTomlUri(uri)) return null;
+        var settings = handler.settings;
+        applyTomlSettingsForUri(handler.allocator, uri, &settings);
+        if (!settings.format) return null;
 
         const text = handler.docs.get(uri) orelse return null;
         const formatted = handler.formatToml(arena, text) orelse return null;
@@ -178,6 +186,9 @@ const Server = struct {
 
         const uri = extractUriFromArgs(params.arguments) orelse return null;
         if (!isTomlUri(uri)) return null;
+        var settings = handler.settings;
+        applyTomlSettingsForUri(handler.allocator, uri, &settings);
+        if (!settings.format) return null;
 
         const text = handler.docs.get(uri) orelse return null;
         const formatted = handler.formatToml(arena, text) orelse return null;
@@ -356,6 +367,16 @@ const Server = struct {
         defer handler.allocator.free(masked.masked);
         defer handler.allocator.free(masked.spans);
 
+        const masked_format = jade.maskJinjaForFormat(handler.allocator, text) catch return;
+        defer handler.allocator.free(masked_format.masked);
+        defer {
+            for (masked_format.placeholders) |ph| {
+                handler.allocator.free(ph.token);
+                handler.allocator.free(ph.original);
+            }
+            handler.allocator.free(masked_format.placeholders);
+        }
+
         const template_spans = jade.templateSpans(handler.allocator, text) catch return;
         defer handler.allocator.free(template_spans);
 
@@ -424,6 +445,31 @@ const Server = struct {
                         span,
                         parsed.value,
                         settings.diagnostics.templates.missing_key.severity,
+                        &allocated_messages,
+                    )) |diag| {
+                        diagnostics.append(handler.allocator, diag) catch {};
+                    }
+                }
+            }
+
+            if (settings.diagnostics.templates.cycle.enabled) {
+                var cycle_parser = toml.Parser(toml.Table).init(handler.allocator);
+                defer cycle_parser.deinit();
+                const cycle_parsed = cycle_parser.parseString(masked_format.masked) catch {
+                    handler.publishDiagnostics(uri, diagnostics.items);
+                    return;
+                };
+                defer cycle_parsed.deinit();
+
+                for (template_spans) |span| {
+                    if (!span.in_quotes) continue;
+                    if (templateCycleDiagnostic(
+                        handler.allocator,
+                        text,
+                        span,
+                        cycle_parsed.value,
+                        masked_format.placeholders,
+                        settings.diagnostics.templates.cycle.severity,
                         &allocated_messages,
                     )) |diag| {
                         diagnostics.append(handler.allocator, diag) catch {};
@@ -563,7 +609,7 @@ const Server = struct {
             if (extractTemplatePath(arena, full_text, span)) |template_path| {
                 defer arena.free(template_path);
                 if (lookupTomlValue(parsed.value, template_path)) |expanded| {
-                    const expanded_text = tomlValueString(arena, expanded) orelse return null;
+                    const expanded_text = tomlValueStringExpanded(arena, expanded, placeholders, parsed.value) catch return null;
                     return .{
                         .ty = tomlValueType(value),
                         .value = expanded_text,
@@ -652,6 +698,35 @@ fn templateMissingKeyDiagnostic(
     defer allocator.free(path_string);
 
     const message = std.fmt.allocPrint(allocator, "Template reference not found: {s}", .{path_string}) catch return null;
+    allocated_messages.append(allocator, message) catch return null;
+
+    return .{
+        .range = range,
+        .severity = diagnosticSeverityToLsp(severity),
+        .source = "jade",
+        .message = message,
+    };
+}
+
+fn templateCycleDiagnostic(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    span: jade.TemplateSpan,
+    root: toml.Table,
+    placeholders: []const jade.Placeholder,
+    severity: DiagnosticsSeverity,
+    allocated_messages: *std.ArrayList([]u8),
+) ?types.Diagnostic {
+    const path = extractTemplatePath(allocator, text, span) orelse return null;
+    defer allocator.free(path);
+
+    if (!templatePathHasCycle(allocator, path, root, placeholders)) return null;
+
+    const range = rangeFromSpan(text, span.start, span.end);
+    const path_string = joinPathForMessage(allocator, path) catch return null;
+    defer allocator.free(path_string);
+
+    const message = std.fmt.allocPrint(allocator, "Template reference is cyclic: {s}", .{path_string}) catch return null;
     allocated_messages.append(allocator, message) catch return null;
 
     return .{
@@ -801,11 +876,12 @@ fn extractTemplatePathFromString(allocator: std.mem.Allocator, original: []const
     return splitDottedPath(allocator, inner[0..token_end]);
 }
 
-fn expandPlaceholderValue(
+fn expandPlaceholderValueDepth(
     allocator: std.mem.Allocator,
     placeholders: []const jade.Placeholder,
     root: toml.Table,
     value: toml.Value,
+    depth: usize,
 ) ?[]const u8 {
     if (value != .string) return null;
     const s = value.string;
@@ -814,7 +890,7 @@ fn expandPlaceholderValue(
             if (extractTemplatePathFromString(allocator, ph.original)) |path| {
                 defer allocator.free(path);
                 if (lookupTomlValue(root, path)) |expanded| {
-                    return tomlValueString(allocator, expanded);
+                    return tomlValueStringExpandedDepth(allocator, expanded, placeholders, root, depth + 1) catch null;
                 }
             }
         }
@@ -828,6 +904,19 @@ fn tomlValueStringExpanded(
     placeholders: []const jade.Placeholder,
     root: toml.Table,
 ) anyerror![]const u8 {
+    return tomlValueStringExpandedDepth(allocator, value, placeholders, root, 0);
+}
+
+fn tomlValueStringExpandedDepth(
+    allocator: std.mem.Allocator,
+    value: toml.Value,
+    placeholders: []const jade.Placeholder,
+    root: toml.Table,
+    depth: usize,
+) anyerror![]const u8 {
+    if (depth > 8) {
+        return tomlValueString(allocator, value) orelse return error.OutOfMemory;
+    }
     switch (value) {
         .array => |ar| {
             var out: std.ArrayList(u8) = .empty;
@@ -835,7 +924,7 @@ fn tomlValueStringExpanded(
             try out.appendSlice(allocator, "[ ");
             for (ar.items, 0..) |item, idx| {
                 if (idx > 0) try out.appendSlice(allocator, ", ");
-                if (expandPlaceholderValue(allocator, placeholders, root, item)) |expanded| {
+                if (expandPlaceholderValueDepth(allocator, placeholders, root, item, depth)) |expanded| {
                     defer allocator.free(expanded);
                     try out.appendSlice(allocator, expanded);
                 } else {
@@ -849,12 +938,59 @@ fn tomlValueStringExpanded(
         },
         .table => |_| return tomlValueString(allocator, value) orelse return error.OutOfMemory,
         else => {
-            if (expandPlaceholderValue(allocator, placeholders, root, value)) |expanded| {
+            if (expandPlaceholderValueDepth(allocator, placeholders, root, value, depth)) |expanded| {
                 return expanded;
             }
             return tomlValueString(allocator, value) orelse return error.OutOfMemory;
         },
     }
+}
+
+fn templatePathHasCycle(
+    allocator: std.mem.Allocator,
+    path: []const []const u8,
+    root: toml.Table,
+    placeholders: []const jade.Placeholder,
+) bool {
+    var visited: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (visited.items) |entry| allocator.free(entry);
+        visited.deinit(allocator);
+    }
+
+    return templatePathHasCycleRec(allocator, path, root, placeholders, &visited);
+}
+
+fn templatePathHasCycleRec(
+    allocator: std.mem.Allocator,
+    path: []const []const u8,
+    root: toml.Table,
+    placeholders: []const jade.Placeholder,
+    visited: *std.ArrayList([]const u8),
+) bool {
+    const key = joinPathForMessage(allocator, path) catch return false;
+    for (visited.items) |entry| {
+        if (std.mem.eql(u8, entry, key)) {
+            allocator.free(key);
+            return true;
+        }
+    }
+    visited.append(allocator, key) catch {
+        allocator.free(key);
+        return false;
+    };
+
+    const value = lookupTomlValue(root, path) orelse return false;
+    if (value != .string) return false;
+
+    for (placeholders) |ph| {
+        if (!std.mem.eql(u8, ph.token, value.string)) continue;
+        if (extractTemplatePathFromString(allocator, ph.original)) |next_path| {
+            defer allocator.free(next_path);
+            return templatePathHasCycleRec(allocator, next_path, root, placeholders, visited);
+        }
+    }
+    return false;
 }
 
 fn tomlValueString(allocator: std.mem.Allocator, value: toml.Value) ?[]const u8 {
@@ -1739,7 +1875,14 @@ fn applyJsonSettings(settings: *Settings, value: std.json.Value) void {
             if (diag.object.get("templateMissingKey")) |missing| {
                 applyJsonRule(&settings.diagnostics.templates.missing_key, missing);
             }
+            if (diag.object.get("templateCycle")) |cycle| {
+                applyJsonRule(&settings.diagnostics.templates.cycle, cycle);
+            }
         }
+    }
+
+    if (obj.get("format")) |fmt| {
+        if (fmt == .bool) settings.format = fmt.bool;
     }
 }
 
@@ -1750,6 +1893,9 @@ fn applyJsonTemplateSettings(settings: *TemplateDiagnosticsSettings, value: std.
     }
     if (value.object.get("missing_key")) |missing| {
         applyJsonRule(&settings.missing_key, missing);
+    }
+    if (value.object.get("cycle")) |cycle| {
+        applyJsonRule(&settings.cycle, cycle);
     }
 }
 
@@ -1790,6 +1936,9 @@ fn applyTomlSettingsForUri(allocator: std.mem.Allocator, uri: []const u8, settin
 }
 
 fn applyTomlSettings(settings: *Settings, table: toml.Table) void {
+    if (table.get("format")) |fmt| {
+        if (fmt == .boolean) settings.format = fmt.boolean;
+    }
     if (table.get("diagnostics")) |diag_value| {
         switch (diag_value) {
             .table => |t| {
@@ -1818,6 +1967,9 @@ fn applyTomlTemplateSettings(settings: *TemplateDiagnosticsSettings, value: toml
             }
             if (tmpl_table.get("missing_key")) |missing| {
                 applyTomlRule(&settings.missing_key, missing);
+            }
+            if (tmpl_table.get("cycle")) |cycle| {
+                applyTomlRule(&settings.cycle, cycle);
             }
         },
         else => {},
@@ -1890,7 +2042,10 @@ fn findConfigUpwards(allocator: std.mem.Allocator, start_dir: []const u8) ?[]u8 
     var current = allocator.dupe(u8, start_dir) catch return null;
 
     while (true) {
-        const candidate = std.fs.path.join(allocator, &.{ current, "jade.toml" }) catch return null;
+        const candidate = std.fs.path.join(allocator, &.{ current, "jade.toml" }) catch {
+            allocator.free(current);
+            return null;
+        };
         defer allocator.free(candidate);
 
         if (fileExists(candidate)) {
@@ -1899,12 +2054,18 @@ fn findConfigUpwards(allocator: std.mem.Allocator, start_dir: []const u8) ?[]u8 
             return found;
         }
 
-        const parent = std.fs.path.dirname(current) orelse return null;
+        const parent = std.fs.path.dirname(current) orelse {
+            allocator.free(current);
+            return null;
+        };
         if (std.mem.eql(u8, parent, current)) {
             allocator.free(current);
             return null;
         }
-        const next = allocator.dupe(u8, parent) catch return null;
+        const next = allocator.dupe(u8, parent) catch {
+            allocator.free(current);
+            return null;
+        };
         allocator.free(current);
         current = next;
     }
@@ -2762,6 +2923,122 @@ test "definition finds inline table keys" {
     defer allocator.free(path);
     const range = findKeyDefinitionRange(allocator, text, path) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(i64, 1), range.start.line);
+}
+
+test "hover resolves template referencing same table values" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\[params]
+        \\labels = ["alpha", "beta"]
+        \\[server]
+        \\aliases = ["{{ params.labels.0 }}", "edge"]
+        \\self_alias = "{{ server.aliases.0 }}"
+        \\
+    ;
+
+    const span_mask = jade.maskJinja(allocator, text) catch return error.TestFailed;
+    defer allocator.free(span_mask.masked);
+    defer allocator.free(span_mask.spans);
+
+    const masked = jade.maskJinjaForFormat(allocator, text) catch return error.TestFailed;
+    defer allocator.free(masked.masked);
+    defer {
+        for (masked.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked.placeholders);
+    }
+
+    var server: Server = undefined;
+    const line_text = jade.lineSlice(text, 4) orelse return error.TestFailed;
+    const pos = std.mem.indexOf(u8, line_text, "self_alias") orelse return error.TestFailed;
+    const info = server.resolveHoverInfo(allocator, masked.masked, text, 4, pos, span_mask.spans, masked.placeholders) orelse
+        return error.TestFailed;
+    defer allocator.free(info.value);
+    defer allocator.free(info.key);
+    defer allocator.free(info.table);
+    try std.testing.expect(std.mem.indexOf(u8, info.value, "alpha") != null);
+}
+
+test "diagnostic detects template cycles" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const text =
+        \\[params]
+        \\a = "{{ params.b }}"
+        \\b = "{{ params.a }}"
+        \\
+    ;
+
+    const mask = jade.maskJinjaForFormat(allocator, text) catch return error.TestFailed;
+    defer allocator.free(mask.masked);
+    defer {
+        for (mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(mask.placeholders);
+    }
+
+    const spans = jade.templateSpans(allocator, text) catch return error.TestFailed;
+    defer allocator.free(spans);
+
+    var parser = toml.Parser(toml.Table).init(allocator);
+    defer parser.deinit();
+    const parsed = parser.parseString(mask.masked) catch return error.TestFailed;
+    defer parsed.deinit();
+
+    var messages: std.ArrayList([]u8) = .empty;
+    defer {
+        for (messages.items) |msg| allocator.free(msg);
+        messages.deinit(allocator);
+    }
+
+    var found = false;
+    for (spans) |span| {
+        if (templateCycleDiagnostic(allocator, text, span, parsed.value, mask.placeholders, .warn, &messages)) |_| {
+            found = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(found);
+}
+
+test "formatting disabled returns null" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var store = jade.DocumentStore.init(allocator);
+    defer store.deinit();
+
+    var server = Server{
+        .allocator = allocator,
+        .transport = undefined,
+        .docs = &store,
+        .settings = .{ .format = false },
+    };
+
+    const text = "b = 2\na = 1\n";
+    try store.set("file:///test.toml", text);
+
+    const params: lsp.ParamsType("textDocument/formatting") = .{
+        .textDocument = .{ .uri = "file:///test.toml" },
+        .options = .{
+            .tabSize = 4,
+            .insertSpaces = true,
+        },
+    };
+
+    const result = server.@"textDocument/formatting"(allocator, params);
+    try std.testing.expect(result == null);
 }
 
 test "array-of-tables hover resolves correct item per header" {

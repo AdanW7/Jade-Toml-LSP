@@ -1,3 +1,5 @@
+format = true
+
 [diagnostics]
 enabled = true
 severity = "error"
@@ -7,5 +9,9 @@ enabled = true
 severity = "error"
 
 [diagnostics.templates.missing_key]
+enabled = true
+severity = "error"
+
+[diagnostics.templates.cycle]
 enabled = true
 severity = "error"

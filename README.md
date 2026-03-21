@@ -16,6 +16,8 @@ Inspired by the structure of ZLS and superhtml, and built on lsp-kit.
 Create a `jade.toml` in your project root to configure the LSP:
 
 ```toml
+format = true
+
 [diagnostics]
 enabled = true
 severity = "warning" # "error" | "warning" | "info" | "hint" | "off"
@@ -25,6 +27,10 @@ enabled = true
 severity = "error"
 
 [diagnostics.templates.missing_key]
+enabled = true
+severity = "warning"
+
+[diagnostics.templates.cycle]
 enabled = true
 severity = "warning"
 ```
@@ -69,9 +75,18 @@ vim.lsp.config("jade", {
   root_markers = { "jade.toml", ".git" },
   settings = {
     jade = {
+      format = true,
       diagnostics = {
         enabled = true,
         severity = "info",
+        templates = {
+          outside_quotes = { enabled = true, severity = "error" },
+          missing_key = { enabled = true, severity = "warning" },
+          cycle = { enabled = true, severity = "warning" },
+        },
+        templateOutsideQuotes = "error",
+        templateMissingKey = "warning",
+        templateCycle = "warning",
       },
     },
   },

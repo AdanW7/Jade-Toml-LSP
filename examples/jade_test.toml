@@ -16,6 +16,8 @@ ports = [8000, 8001, "{{ params.port }}"]
 aliases = ["{{ params.labels.0 }}", "edge"]
 meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners[0] }}" }
 self_alias = "{{ server.aliases.0 }}"
+cyle_base = "{{ server.cyle_ref}}"
+cyle_ref = "{{ server.cyle_base }}"
 
 [[services]]
 name = "web"
