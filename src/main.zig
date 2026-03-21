@@ -25,6 +25,10 @@ const FormatSettings = struct {
     respect_trailing_commas: bool = false,
 };
 
+const InlayHintsSettings = struct {
+    enabled: bool = false,
+};
+
 const TemplateDiagnosticsSettings = struct {
     outside_quotes: DiagnosticsRule = .{ .severity = .err },
     missing_key: DiagnosticsRule = .{ .severity = .warn },
@@ -42,6 +46,7 @@ const DiagnosticsRule = struct {
 const Settings = struct {
     diagnostics: DiagnosticsSettings = .{},
     format: FormatSettings = .{},
+    inlay_hints: InlayHintsSettings = .{},
 };
 
 const Server = struct {
@@ -76,6 +81,7 @@ const Server = struct {
                 .hoverProvider = .{ .bool = true },
                 .definitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
+                .inlayHintProvider = .{ .bool = true },
             },
             .serverInfo = .{
                 .name = "jade",
@@ -379,6 +385,100 @@ const Server = struct {
         };
 
         return .{ .CompletionList = list };
+    }
+
+    pub fn @"textDocument/inlayHint"(
+        handler: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/inlayHint"),
+    ) lsp.ResultType("textDocument/inlayHint") {
+        const uri = params.textDocument.uri;
+        if (!isTomlUri(uri)) return null;
+
+        var settings = handler.settings;
+        applyTomlSettingsForUri(handler.allocator, uri, &settings);
+        if (!settings.inlay_hints.enabled) return null;
+
+        const text = handler.docs.get(uri) orelse return null;
+
+        const spans = jade.templateSpans(arena, text) catch return null;
+        defer arena.free(spans);
+
+        const ml_mask = maskMultilineStrings(arena, text) catch return null;
+        defer arena.free(ml_mask.masked);
+        defer {
+            for (ml_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(ml_mask.placeholders);
+        }
+
+        const masked_lenient = jade.maskJinjaForFormatLenient(arena, ml_mask.masked) catch return null;
+        defer arena.free(masked_lenient.masked);
+        defer {
+            for (masked_lenient.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(masked_lenient.placeholders);
+        }
+
+        const float_mask = maskSpecialFloats(arena, masked_lenient.masked) catch return null;
+        defer arena.free(float_mask.masked);
+        defer {
+            for (float_mask.placeholders) |ph| {
+                arena.free(ph.token);
+                arena.free(ph.original);
+            }
+            arena.free(float_mask.placeholders);
+        }
+
+        const unicode_masked = normalizeUnicodeEscapes(arena, float_mask.masked) catch return null;
+        defer arena.free(unicode_masked);
+
+        const combined_placeholders = mergePlaceholders(arena, masked_lenient.placeholders, float_mask.placeholders) catch return null;
+        const combined_placeholders2 = mergePlaceholders(arena, combined_placeholders, ml_mask.placeholders) catch return null;
+        defer arena.free(combined_placeholders);
+        defer arena.free(combined_placeholders2);
+
+        var parser = toml.Parser(toml.Table).init(arena);
+        defer parser.deinit();
+        const parsed = parser.parseString(unicode_masked) catch return null;
+        defer parsed.deinit();
+
+        var hints: std.ArrayList(types.InlayHint) = .empty;
+        defer hints.deinit(arena);
+
+        for (spans) |span| {
+            if (!span.in_quotes) continue;
+            if (spanInLineComment(text, span)) continue;
+
+            const insert_idx = templateInlayIndex(text, span) orelse continue;
+            const insert_pos = positionFromIndex(text, insert_idx);
+            if (!positionInRange(insert_pos, params.range)) continue;
+
+            const path = extractTemplatePath(arena, text, span) orelse continue;
+            defer arena.free(path);
+            const value = lookupTomlValue(parsed.value, path) orelse continue;
+
+            const display_value = inlayValueText(arena, value, combined_placeholders2, parsed.value) orelse continue;
+            const label = std.fmt.allocPrint(arena, ": {s}", .{display_value}) catch return null;
+
+            hints.append(arena, .{
+                .position = .{
+                    .line = @intCast(insert_pos.line),
+                    .character = @intCast(insert_pos.character),
+                },
+                .label = .{ .string = label },
+                .kind = .Type,
+                .paddingLeft = true,
+                .paddingRight = true,
+            }) catch return null;
+        }
+
+        if (hints.items.len == 0) return null;
+        return hints.toOwnedSlice(arena) catch null;
     }
 
     pub fn @"textDocument/definition"(
@@ -1899,6 +1999,49 @@ fn positionFromIndex(text: []const u8, index: usize) TextPosition {
         }
     }
     return .{ .line = line, .character = col };
+}
+
+fn positionInRange(pos: TextPosition, range: types.Range) bool {
+    if (pos.line < range.start.line) return false;
+    if (pos.line > range.end.line) return false;
+    if (pos.line == range.start.line and pos.character < range.start.character) return false;
+    if (pos.line == range.end.line and pos.character > range.end.character) return false;
+    return true;
+}
+
+fn templateInlayIndex(text: []const u8, span: jade.TemplateSpan) ?usize {
+    if (span.end <= span.start + 4) return null;
+    const inner_full = text[span.start + 2 .. span.end - 2];
+    var offset: usize = 0;
+    while (offset < inner_full.len and (inner_full[offset] == ' ' or inner_full[offset] == '\t' or inner_full[offset] == '\r' or inner_full[offset] == '\n')) {
+        offset += 1;
+    }
+    if (offset >= inner_full.len) return null;
+    const token = inner_full[offset..];
+    const token_end = findTemplateTokenEnd(token);
+    if (token_end == 0) return null;
+    return span.start + 2 + offset + token_end;
+}
+
+fn inlayValueText(
+    allocator: std.mem.Allocator,
+    value: toml.Value,
+    placeholders: []const jade.Placeholder,
+    root: toml.Table,
+) ?[]const u8 {
+    switch (value) {
+        .string => {
+            if (expandPlaceholderValueDepth(allocator, placeholders, root, value, 0)) |expanded| {
+                defer allocator.free(expanded);
+                if (expanded.len >= 2 and expanded[0] == '"' and expanded[expanded.len - 1] == '"') {
+                    return allocator.dupe(u8, expanded[1 .. expanded.len - 1]) catch null;
+                }
+                return allocator.dupe(u8, expanded) catch null;
+            }
+            return allocator.dupe(u8, value.string) catch null;
+        },
+        else => return tomlValueStringExpanded(allocator, value, placeholders, root) catch null,
+    }
 }
 
 fn extractTemplatePath(allocator: std.mem.Allocator, text: []const u8, span: jade.TemplateSpan) ?[][]const u8 {
@@ -3578,6 +3721,29 @@ fn applyJsonSettings(settings: *Settings, value: std.json.Value) void {
             else => {},
         }
     }
+
+    if (obj.get("inlayHints")) |inlay| {
+        switch (inlay) {
+            .bool => |b| settings.inlay_hints.enabled = b,
+            .object => |inlay_obj| {
+                if (inlay_obj.get("enabled")) |enabled| {
+                    if (enabled == .bool) settings.inlay_hints.enabled = enabled.bool;
+                }
+            },
+            else => {},
+        }
+    }
+    if (obj.get("inlay_hints")) |inlay| {
+        switch (inlay) {
+            .bool => |b| settings.inlay_hints.enabled = b,
+            .object => |inlay_obj| {
+                if (inlay_obj.get("enabled")) |enabled| {
+                    if (enabled == .bool) settings.inlay_hints.enabled = enabled.bool;
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 fn applyJsonTemplateSettings(settings: *TemplateDiagnosticsSettings, value: std.json.Value) void {
@@ -3649,6 +3815,18 @@ fn applyTomlSettings(settings: *Settings, table: toml.Table) void {
                 }
                 if (fmt_table.get("respect_trailing_commas")) |rtc| {
                     if (rtc == .boolean) settings.format.respect_trailing_commas = rtc.boolean;
+                }
+            },
+            else => {},
+        }
+    }
+    if (table.get("inlay_hints")) |inlay| {
+        switch (inlay) {
+            .boolean => |b| settings.inlay_hints.enabled = b,
+            .table => |t| {
+                const inlay_table = t.*;
+                if (inlay_table.get("enabled")) |enabled| {
+                    if (enabled == .boolean) settings.inlay_hints.enabled = enabled.boolean;
                 }
             },
             else => {},
@@ -5476,3 +5654,68 @@ test "array-of-tables hover resolves correct item per header" {
     try std.testing.expect(std.mem.indexOf(u8, hover1.value, "worker") != null);
 }
 
+test "inlay hints show expanded template values" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\title = "{{ params.title }}"
+        \\
+        \\[params]
+        \\title = "Example"
+    ;
+
+    const spans = try jade.templateSpans(allocator, text);
+    defer allocator.free(spans);
+    try std.testing.expect(spans.len > 0);
+
+    const ml_mask = try maskMultilineStrings(allocator, text);
+    defer allocator.free(ml_mask.masked);
+    defer {
+        for (ml_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(ml_mask.placeholders);
+    }
+
+    const masked_lenient = try jade.maskJinjaForFormatLenient(allocator, ml_mask.masked);
+    defer allocator.free(masked_lenient.masked);
+    defer {
+        for (masked_lenient.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(masked_lenient.placeholders);
+    }
+
+    const float_mask = try maskSpecialFloats(allocator, masked_lenient.masked);
+    defer allocator.free(float_mask.masked);
+    defer {
+        for (float_mask.placeholders) |ph| {
+            allocator.free(ph.token);
+            allocator.free(ph.original);
+        }
+        allocator.free(float_mask.placeholders);
+    }
+
+    const unicode_masked = try normalizeUnicodeEscapes(allocator, float_mask.masked);
+    defer allocator.free(unicode_masked);
+
+    const combined_placeholders = try mergePlaceholders(allocator, masked_lenient.placeholders, float_mask.placeholders);
+    const combined_placeholders2 = try mergePlaceholders(allocator, combined_placeholders, ml_mask.placeholders);
+    defer allocator.free(combined_placeholders);
+    defer allocator.free(combined_placeholders2);
+
+    var parser = toml.Parser(toml.Table).init(allocator);
+    defer parser.deinit();
+    const parsed = try parser.parseString(unicode_masked);
+    defer parsed.deinit();
+
+    const path = extractTemplatePath(allocator, text, spans[0]) orelse return error.TestFailed;
+    defer allocator.free(path);
+
+    const value = lookupTomlValue(parsed.value, path) orelse return error.TestFailed;
+    const display = inlayValueText(allocator, value, combined_placeholders2, parsed.value) orelse return error.TestFailed;
+    defer allocator.free(display);
+
+    try std.testing.expectEqualStrings("Example", display);
+}

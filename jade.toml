@@ -29,3 +29,6 @@ severity = "warning"
 [diagnostics.templates.in_headers]
 enabled = true
 severity = "warning"
+
+[inlay_hints]
+enabled = true
