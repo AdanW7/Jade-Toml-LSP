@@ -4401,6 +4401,63 @@ fn formatTomlText(allocator: std.mem.Allocator, text: []const u8, format_setting
     return current;
 }
 
+fn expectPathEq(path: [][]const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, path.len);
+    for (expected, 0..) |exp, idx| {
+        try std.testing.expectEqualStrings(exp, path[idx]);
+    }
+}
+
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    if (try runCli(allocator)) return;
+
+    var read_buffer: [4096]u8 = undefined;
+    var stdio = lsp.Transport.Stdio.init(&read_buffer, std.fs.File.stdin(), std.fs.File.stdout());
+
+    var docs = jade.DocumentStore.init(allocator);
+    defer docs.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .transport = &stdio.transport,
+        .docs = &docs,
+        .settings = .{},
+    };
+
+    try lsp.basic_server.run(allocator, &stdio.transport, &server, std.log.scoped(.jade).err);
+}
+
+fn runCli(allocator: std.mem.Allocator) !bool {
+    var arg_it: std.process.ArgIterator = try .initWithAllocator(allocator);
+    defer arg_it.deinit();
+
+    _ = arg_it.skip();
+    const cmd = arg_it.next() orelse return false;
+    if (!std.mem.eql(u8, cmd, "format")) return false;
+
+    const path = arg_it.next() orelse return error.MissingPath;
+    try formatTomlFile(allocator, path);
+    return true;
+}
+
+fn formatTomlFile(allocator: std.mem.Allocator, path: []const u8) !void {
+    const max_bytes = 16 * 1024 * 1024;
+    const text = try std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
+    defer allocator.free(text);
+
+    const formatted = formatTomlText(allocator, text, .{}) orelse return error.FormatFailed;
+    defer allocator.free(formatted);
+
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    try file.writeAll(formatted);
+}
+
 test "formatTomlText preserves template placeholders" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -4537,12 +4594,6 @@ test "extractKeyPathAt picks prefix based on cursor position" {
     try std.testing.expectEqualStrings("root", path[0]);
 }
 
-fn expectPathEq(path: [][]const u8, expected: []const []const u8) !void {
-    try std.testing.expectEqual(expected.len, path.len);
-    for (expected, 0..) |exp, idx| {
-        try std.testing.expectEqualStrings(exp, path[idx]);
-    }
-}
 
 test "resolveKeyPathAt handles inline tables" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -5425,52 +5476,3 @@ test "array-of-tables hover resolves correct item per header" {
     try std.testing.expect(std.mem.indexOf(u8, hover1.value, "worker") != null);
 }
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    if (try runCli(allocator)) return;
-
-    var read_buffer: [4096]u8 = undefined;
-    var stdio = lsp.Transport.Stdio.init(&read_buffer, std.fs.File.stdin(), std.fs.File.stdout());
-
-    var docs = jade.DocumentStore.init(allocator);
-    defer docs.deinit();
-
-    var server: Server = .{
-        .allocator = allocator,
-        .transport = &stdio.transport,
-        .docs = &docs,
-        .settings = .{},
-    };
-
-    try lsp.basic_server.run(allocator, &stdio.transport, &server, std.log.scoped(.jade).err);
-}
-
-fn runCli(allocator: std.mem.Allocator) !bool {
-    var arg_it: std.process.ArgIterator = try .initWithAllocator(allocator);
-    defer arg_it.deinit();
-
-    _ = arg_it.skip();
-    const cmd = arg_it.next() orelse return false;
-    if (!std.mem.eql(u8, cmd, "format")) return false;
-
-    const path = arg_it.next() orelse return error.MissingPath;
-    try formatTomlFile(allocator, path);
-    return true;
-}
-
-fn formatTomlFile(allocator: std.mem.Allocator, path: []const u8) !void {
-    const max_bytes = 16 * 1024 * 1024;
-    const text = try std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
-    defer allocator.free(text);
-
-    const formatted = formatTomlText(allocator, text, .{}) orelse return error.FormatFailed;
-    defer allocator.free(formatted);
-
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-
-    try file.writeAll(formatted);
-}

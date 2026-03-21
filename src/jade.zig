@@ -371,6 +371,56 @@ pub fn replaceAll(allocator: std.mem.Allocator, haystack: []const u8, needle: []
     return out.toOwnedSlice(allocator);
 }
 
+pub const Document = struct {
+    uri: []const u8,
+    text: []u8,
+};
+
+pub const DocumentStore = struct {
+    allocator: std.mem.Allocator,
+    docs: std.StringHashMapUnmanaged(Document) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) DocumentStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *DocumentStore) void {
+        var it = self.docs.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.text);
+        }
+        self.docs.deinit(self.allocator);
+    }
+
+    pub fn set(self: *DocumentStore, uri: []const u8, text: []const u8) !void {
+        if (self.docs.getEntry(uri)) |entry| {
+            self.allocator.free(entry.value_ptr.text);
+            entry.value_ptr.text = try self.allocator.dupe(u8, text);
+            return;
+        }
+
+        const uri_owned = try self.allocator.dupe(u8, uri);
+        const text_owned = try self.allocator.dupe(u8, text);
+        try self.docs.put(self.allocator, uri_owned, .{
+            .uri = uri_owned,
+            .text = text_owned,
+        });
+    }
+
+    pub fn remove(self: *DocumentStore, uri: []const u8) void {
+        if (self.docs.fetchRemove(uri)) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value.text);
+        }
+    }
+
+    pub fn get(self: *DocumentStore, uri: []const u8) ?[]const u8 {
+        const doc = self.docs.get(uri) orelse return null;
+        return doc.text;
+    }
+};
+
 test "maskJinja captures spans and masks" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -431,53 +481,3 @@ test "lineSlice and errorSpan" {
     try std.testing.expect(span.start <= span.end);
     try std.testing.expect(span.end <= line1.len);
 }
-
-pub const Document = struct {
-    uri: []const u8,
-    text: []u8,
-};
-
-pub const DocumentStore = struct {
-    allocator: std.mem.Allocator,
-    docs: std.StringHashMapUnmanaged(Document) = .{},
-
-    pub fn init(allocator: std.mem.Allocator) DocumentStore {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *DocumentStore) void {
-        var it = self.docs.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.text);
-        }
-        self.docs.deinit(self.allocator);
-    }
-
-    pub fn set(self: *DocumentStore, uri: []const u8, text: []const u8) !void {
-        if (self.docs.getEntry(uri)) |entry| {
-            self.allocator.free(entry.value_ptr.text);
-            entry.value_ptr.text = try self.allocator.dupe(u8, text);
-            return;
-        }
-
-        const uri_owned = try self.allocator.dupe(u8, uri);
-        const text_owned = try self.allocator.dupe(u8, text);
-        try self.docs.put(self.allocator, uri_owned, .{
-            .uri = uri_owned,
-            .text = text_owned,
-        });
-    }
-
-    pub fn remove(self: *DocumentStore, uri: []const u8) void {
-        if (self.docs.fetchRemove(uri)) |entry| {
-            self.allocator.free(entry.key);
-            self.allocator.free(entry.value.text);
-        }
-    }
-
-    pub fn get(self: *DocumentStore, uri: []const u8) ?[]const u8 {
-        const doc = self.docs.get(uri) orelse return null;
-        return doc.text;
-    }
-};
