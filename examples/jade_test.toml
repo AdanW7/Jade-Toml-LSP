@@ -1,0 +1,14 @@
+title = "{{ params.title }}"
+[params]
+port = 9000
+retries = 2
+title = "Example"
+[server]
+host = "127.0.0.1"
+ports = [ 8000, 8001, "{{ params.port }}" ]
+[[services]]
+config = { retries = "{{ params.retries }}", timeout = 30 }
+name = "web"
+[[services]]
+config = { retries = 1, timeout = 60 }
+name = "worker"

@@ -1,0 +1,11 @@
+[diagnostics]
+enabled = true
+severity = "error"
+
+[diagnostics.templates.outside_quotes]
+enabled = true
+severity = "error"
+
+[diagnostics.templates.missing_key]
+enabled = true
+severity = "error"
