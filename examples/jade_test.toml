@@ -22,6 +22,8 @@ trimmed in raw strings.
 quoted_key_value = "value"
 "127.0.0.1" = "quoted key"
 'quoted "value"' = "quoted key with quotes"
+"a.b" = "dotted key"
+"key with spaces" = "spaced key"
 # "" = "blank key" # allowed by spec but rejected by some parsers
 [params]
 key = "not good"
@@ -37,6 +39,10 @@ owners = ["alice", "bob"]
 thresholds = [1, 2, 3]
 limits = { min = 1, max = 5 }
 flags = { enabled = true, limit = 3, note = "{{ params.title }}" }
+alias_key = "key with spaces"
+ref_dotted = "{{ \"a.b\" }}"
+ref_spaced = "{{ \"key with spaces\" }}"
+ref_quoute = "{{ \"127.0.0.1\" }}"
 
 # ---- Numbers, booleans, and special floats ----
 int_pos = +99
@@ -68,13 +74,29 @@ host = "127.0.0.1"
 ports = [8000, 8001, "{{ params.port }}"]
 aliases = ["{{ params.labels.0 }}", "edge"]
 meta = { region = "us-east-1", note = "{{ params.title }}", owner = "{{ params.owners[0] }}" }
-self_alias = "{{ server.aliases.0 }}"
+self_alias = "{{ server.aliases[0] }}"
+# relative template path (resolved against [server])
+alias_short = "{{ aliases.1 }}"
+meta_owner_short = "{{ meta.owner }}"
+# quoted keys inside templates
+dotted_key_ref = "{{ \"a.b\" }}"
+spaced_key_ref = "{{ \"key with spaces\" }}"
+# dotted keys with array indices inside templates
+labels_ref = "{{ params.labels[2] }}"
 # cyle_base = "{{ server.cyle_ref}}"
 # cyle_ref = "{{ server.cyle_base }}"
-inline_bad = { "{{ params.bad_key }}" = 1 }
+# inline_bad = { "{{ params.bad_key }}" = 1 }
 
 # array of inline tables
 points = [ { x = 1, y = 2, z = 3 }, { x = 7, y = 8, z = 9 }, { x = 2, y = 4, z = 8 } ]
+
+# nested arrays of inline tables (projection vs indexed)
+tests = [
+  { id = 1, relationships = [ { id = 10, type = "a" }, { id = 11, type = "b" } ] },
+  { id = 2, relationships = [ { id = 20, type = "c" }, { id = 21, type = "d" } ] },
+]
+rel_ids = "{{ server.tests.relationships.id }}"
+rel_first = "{{ server.tests[0].relationships[0].id}}"
 
 # dotted keys create tables
 fruit.type = "fruit"
@@ -96,6 +118,7 @@ tags = [
     "{{ params.labels[1] }}",
 ]
 limits = { min = "{{ params.limits.min }}", max = "{{ params.limits.max }}" }
+inline_ref = "{{ config.timeout }}"
 
 # template in key (diagnostic)
 "{{ params.key }}" = "bad key"
