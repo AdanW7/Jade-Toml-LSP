@@ -1,5 +1,7 @@
 # Jade TOML LSP
 
+Jade (Jade Ain't a Damn Jinja Expander) is a TOML LSP for templated configs.
+
 Repository: https://github.com/AdanW7/Jade-Toml-LSP
 
 Jade TOML LSP brings language-server features for templated TOML
