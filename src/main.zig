@@ -15,7 +15,7 @@ const DiagnosticsSeverity = enum {
 };
 
 const DiagnosticsSettings = struct {
-    enabled: bool = true,
+    enabled: bool = false,
     severity: DiagnosticsSeverity = .err,
     templates: TemplateDiagnosticsSettings = .{},
 };
@@ -2868,7 +2868,7 @@ fn tableHeaderHasTemplate(line_text: []const u8) bool {
 
 fn tableHeaderInfo(allocator: std.mem.Allocator, text: []const u8, line: usize) ?TableHeaderInfo {
     const line_text = jade.lineSlice(text, line) orelse return null;
-    const trimmed = std.mem.trim(u8, line_text, " \t");
+    const trimmed = std.mem.trim(u8, line_text, " \t\r");
     if (trimmed.len < 3 or trimmed[0] != '[') return null;
 
     const is_array = trimmed.len >= 4 and trimmed[0] == '[' and trimmed[1] == '[';
@@ -4126,7 +4126,7 @@ fn parseTableHeaderPath(allocator: std.mem.Allocator, line_text: []const u8) ?[]
 }
 
 fn parseTableHeaderPathAt(allocator: std.mem.Allocator, line_text: []const u8, character: usize) ?[][]const u8 {
-    const trimmed = std.mem.trim(u8, line_text, " \t");
+    const trimmed = std.mem.trim(u8, line_text, " \t\r");
     if (trimmed.len < 3 or trimmed[0] != '[') return null;
 
     var start_index: usize = 1;
@@ -5726,4 +5726,13 @@ test "inlay hints show expanded template values" {
     defer allocator.free(display);
 
     try std.testing.expectEqualStrings("Example", display);
+}
+
+test "table header parses with CRLF" {
+    const allocator = std.testing.allocator;
+    const line = "[a]\r";
+    const path = parseTableHeaderPath(allocator, line) orelse return error.TestFailed;
+    defer allocator.free(path);
+    try std.testing.expectEqual(@as(usize, 1), path.len);
+    try std.testing.expectEqualStrings("a", path[0]);
 }

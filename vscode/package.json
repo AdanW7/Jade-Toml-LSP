@@ -2,7 +2,7 @@
   "name": "jade-toml-lsp",
   "displayName": "Jade TOML LSP",
   "description": "Language Server support for templated TOML with Jade.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "AdanW7",
   "repository": {
     "type": "git",
@@ -58,7 +58,7 @@
         },
         "jade_toml_lsp.diagnostics.enabled": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Enable diagnostics."
         },
         "jade_toml_lsp.diagnostics.severity": {

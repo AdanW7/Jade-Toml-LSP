@@ -20,6 +20,6 @@ Settings map directly to Jade’s LSP settings and `jade.toml`:
 - `jade_toml_lsp.inlayHints.enabled`
 - `jade_toml_lsp.format.enabled`
 - `jade_toml_lsp.format.respect_trailing_commas`
-- `jade_toml_lsp.diagnostics.enabled`
+- `jade_toml_lsp.diagnostics.enabled` (default: false)
 - `jade_toml_lsp.diagnostics.severity`
 - `jade_toml_lsp.diagnostics.templates.*`

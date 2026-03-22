@@ -27,7 +27,7 @@ enabled = true
 respect_trailing_commas = false
 
 [diagnostics]
-enabled = true
+enabled = false
 severity = "warning" # "error" | "warning" | "info" | "hint" | "off"
 
 [diagnostics.templates.outside_quotes]
@@ -106,7 +106,7 @@ vim.lsp.config("jade_toml_lsp", {
         respect_trailing_commas = false,
       },
       diagnostics = {
-        enabled = true,
+        enabled = false,
         severity = "info",
         templates = {
           outside_quotes = { enabled = true, severity = "error" },

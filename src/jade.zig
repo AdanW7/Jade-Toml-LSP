@@ -394,14 +394,16 @@ pub const DocumentStore = struct {
     }
 
     pub fn set(self: *DocumentStore, uri: []const u8, text: []const u8) !void {
+        const normalized = try normalizeNewlines(self.allocator, text);
+        defer self.allocator.free(normalized);
         if (self.docs.getEntry(uri)) |entry| {
             self.allocator.free(entry.value_ptr.text);
-            entry.value_ptr.text = try self.allocator.dupe(u8, text);
+            entry.value_ptr.text = try self.allocator.dupe(u8, normalized);
             return;
         }
 
         const uri_owned = try self.allocator.dupe(u8, uri);
-        const text_owned = try self.allocator.dupe(u8, text);
+        const text_owned = try self.allocator.dupe(u8, normalized);
         try self.docs.put(self.allocator, uri_owned, .{
             .uri = uri_owned,
             .text = text_owned,
@@ -421,6 +423,27 @@ pub const DocumentStore = struct {
     }
 };
 
+fn normalizeNewlines(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, text, '\r') == null) {
+        return allocator.dupe(u8, text);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\r') {
+            if (i + 1 < text.len and text[i + 1] == '\n') {
+                i += 1;
+            }
+            try out.append(allocator, '\n');
+            continue;
+        }
+        try out.append(allocator, text[i]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 test "maskJinja captures spans and masks" {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
@@ -435,6 +458,22 @@ test "maskJinja captures spans and masks" {
     try std.testing.expect(res.spans[0].start == 4);
     try std.testing.expect(res.spans[0].end == input.len - 1);
     try std.testing.expect(std.mem.indexOf(u8, res.masked, "{{") == null);
+}
+
+test "DocumentStore normalizes CRLF to LF" {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var store = DocumentStore.init(allocator);
+    defer store.deinit();
+
+    const text = "a = 1\r\n[b]\r\nc = 2\r\n";
+    try store.set("file:///test.toml", text);
+
+    const got = store.get("file:///test.toml") orelse return error.TestFailed;
+    try std.testing.expect(std.mem.indexOfScalar(u8, got, '\r') == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\n") != null);
 }
 
 test "maskJinjaForFormat allows value templates and blocks key templates" {
